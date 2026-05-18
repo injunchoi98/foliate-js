@@ -309,7 +309,6 @@ class View {
     columnize({ width, height, gap, columnWidth }) {
         const vertical = this.#vertical
         this.#size = vertical ? height : width
-
         const doc = this.document
         setStylesImportant(doc.documentElement, {
             'box-sizing': 'border-box',
@@ -403,6 +402,13 @@ class View {
                 this.#overlayer.element.style.left = '0'
                 this.#overlayer.element.style.top = '0'
                 this.#overlayer.element.style[side] = `${expandedSize}px`
+                // The column branch above sets style.width to expandedSize
+                // (e.g. 5520) when in paginated mode. In scrolled mode `side`
+                // is 'height', so the line above only updates height. Without
+                // explicitly clearing width, the inline 5520 lingers and
+                // inflates ancestor scrollWidth. Reset to 100% to track the
+                // wrapper.
+                this.#overlayer.element.style[otherSide] = '100%'
                 this.#overlayer.redraw()
             }
         }
@@ -411,6 +417,7 @@ class View {
     set overlayer(overlayer) {
         this.#overlayer = overlayer
         this.#element.append(overlayer.element)
+        if (this.document) this.expand()
     }
     get overlayer() {
         return this.#overlayer
@@ -449,6 +456,20 @@ export class Paginator extends HTMLElement {
     #touchState
     #touchScrolled
     #lastVisibleRange
+    #views = []
+    #topSentinel = document.createElement('div')
+    #bottomSentinel = document.createElement('div')
+    #continuousObserver
+    #continuousQueue = Promise.resolve()
+    #continuousCheckTimeout
+    #continuousCheckRAF = 0
+    #continuousTrimTimeout
+    #scrollDelta = 0
+    #scrollDeltaTimeout
+    #prevScrollOffset = 0
+    #continuousPreload = 1200
+    #continuousKeepAround = 1
+    #pendingContinuousAnchor = null
     constructor() {
         super()
         this.#root.innerHTML = `<style>
@@ -507,11 +528,19 @@ export class Paginator extends HTMLElement {
             grid-column: 2 / 5;
             grid-row: 2;
             overflow: hidden;
+            position: relative;
+            scrollbar-width: none;
+            -ms-overflow-style: none;
         }
         :host([flow="scrolled"]) #container {
             grid-column: 1 / -1;
             grid-row: 1 / -1;
             overflow: auto;
+        }
+        #container::-webkit-scrollbar {
+            display: none;
+            width: 0;
+            height: 0;
         }
         #header {
             grid-column: 3 / 4;
@@ -557,12 +586,29 @@ export class Paginator extends HTMLElement {
 
         this.#observer.observe(this.#container)
         this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))
+        this.#container.addEventListener('scroll', () => {
+            if (this.scrolled && this.#views.length) this.#onContinuousScroll()
+        })
         this.#container.addEventListener('scroll', debounce(() => {
             if (this.scrolled) {
                 if (this.#justAnchored) this.#justAnchored = false
+                else if (this.#views.length) this.#afterContinuousScroll('scroll')
                 else this.#afterScroll('scroll')
             }
         }, 250))
+
+        Object.assign(this.#topSentinel.style, {
+            width: '1px',
+            height: '1px',
+            pointerEvents: 'none',
+        })
+        Object.assign(this.#bottomSentinel.style, {
+            width: '1px',
+            height: '1px',
+            pointerEvents: 'none',
+        })
+        this.#topSentinel.setAttribute('aria-hidden', 'true')
+        this.#bottomSentinel.setAttribute('aria-hidden', 'true')
 
         const opts = { passive: false }
         this.addEventListener('touchstart', this.#onTouchStart.bind(this), opts)
@@ -625,9 +671,13 @@ export class Paginator extends HTMLElement {
         }
         this.#mediaQuery.addEventListener('change', this.#mediaQueryListener)
     }
-    attributeChangedCallback(name, _, value) {
+    attributeChangedCallback(name, oldValue, value) {
         switch (name) {
             case 'flow':
+                if (oldValue === value) return
+                if (value === 'scrolled')
+                    this.#enterContinuous(this.#lastVisibleRange ?? this.#anchor)
+                else this.#exitContinuous()
                 this.render()
                 break
             case 'gap':
@@ -674,6 +724,470 @@ export class Paginator extends HTMLElement {
         })
         this.#container.append(this.#view.element)
         return this.#view
+    }
+    #queueContinuous(task) {
+        const run = this.#continuousQueue.then(task, task)
+        this.#continuousQueue = run.catch(() => {})
+        return run
+    }
+    #ensureContinuousSentinels() {
+        if (!this.#topSentinel.parentNode)
+            this.#container.insertBefore(this.#topSentinel, this.#container.firstChild)
+        if (!this.#bottomSentinel.parentNode)
+            this.#container.append(this.#bottomSentinel)
+    }
+    #enterContinuous(anchor = this.#anchor) {
+        this.#pendingContinuousAnchor = anchor
+        this.#ensureContinuousSentinels()
+        if (this.#view && this.#index >= 0 && !this.#views.length)
+            this.#views = [{ index: this.#index, view: this.#view }]
+        // Mirror of the reset in #exitContinuous. Coming from paginated mode,
+        // the container retains the previous flow's scroll offset (scrollLeft
+        // for horizontal). After the CSS overflow swap, that stale offset
+        // doesn't auto-clamp on iOS WebKit, so the viewport ends up shifted
+        // into empty space and the kept view is invisible.
+        this.#container.scrollTop = 0
+        this.#container.scrollLeft = 0
+        this.#installContinuousObserver()
+        this.#prevScrollOffset = this.#continuousStart()
+        this.#scheduleContinuousCheck(0)
+    }
+    #exitContinuous() {
+        this.#pendingContinuousAnchor = null
+        this.#disconnectContinuousObserver()
+        clearTimeout(this.#continuousCheckTimeout)
+        clearTimeout(this.#continuousTrimTimeout)
+        if (this.#continuousCheckRAF) {
+            cancelAnimationFrame(this.#continuousCheckRAF)
+            this.#continuousCheckRAF = 0
+        }
+        if (!this.#views.length) {
+            this.#topSentinel.remove()
+            this.#bottomSentinel.remove()
+            return
+        }
+
+        const active = this.#getActiveViewRecord() ?? this.#views[0]
+        const anchor = active ? this.#getVisibleRangeForRecord(active) : this.#anchor
+        for (const record of this.#views.slice()) {
+            if (record === active) continue
+            this.#removeContinuousRecord(record)
+        }
+        this.#views = []
+        this.#topSentinel.remove()
+        this.#bottomSentinel.remove()
+        if (active) {
+            this.#view = active.view
+            this.#index = active.index
+            this.#anchor = anchor ?? 0
+            // The continuous-mode scroll axis (scrollTop for horizontal,
+            // scrollLeft for vertical) has a non-zero offset from scrolling
+            // through the document. After flow flips, paginated mode uses the
+            // orthogonal axis. The stale offset shifts the wrapper off-screen
+            // (e.g. scrollTop=1472 hides the columnized content). Reset both.
+            this.#container.scrollTop = 0
+            this.#container.scrollLeft = 0
+        }
+        requestAnimationFrame(() =>
+            this.#scrollToAnchor(this.#anchor).catch(() => {}))
+    }
+    #installContinuousObserver() {
+        this.#disconnectContinuousObserver()
+        if (!globalThis.IntersectionObserver) return
+        const margin = this.#vertical
+            ? `0px ${this.#continuousPreload}px`
+            : `${this.#continuousPreload}px 0px`
+        this.#continuousObserver = new IntersectionObserver(entries => {
+            if (entries.some(entry => entry.isIntersecting))
+                this.#scheduleContinuousCheck(0)
+        }, {
+            root: this.#container,
+            rootMargin: margin,
+            threshold: 0,
+        })
+        this.#continuousObserver.observe(this.#topSentinel)
+        this.#continuousObserver.observe(this.#bottomSentinel)
+    }
+    #disconnectContinuousObserver() {
+        this.#continuousObserver?.disconnect()
+        this.#continuousObserver = null
+    }
+    #scheduleContinuousCheck(delay = 30) {
+        // delay=0 means "as soon as possible" — align to the next browser
+        // frame so multiple onExpand/scroll triggers within one frame coalesce
+        // into a single check, and layout reads happen right before paint.
+        if (delay === 0) {
+            if (this.#continuousCheckRAF) return
+            this.#continuousCheckRAF = requestAnimationFrame(() => {
+                this.#continuousCheckRAF = 0
+                this.#checkContinuousEdges().catch(e => console.warn(e))
+            })
+            return
+        }
+        clearTimeout(this.#continuousCheckTimeout)
+        this.#continuousCheckTimeout = setTimeout(() =>
+            this.#checkContinuousEdges().catch(e => console.warn(e)), delay)
+    }
+    #scheduleContinuousTrim(delay = 350) {
+        clearTimeout(this.#continuousTrimTimeout)
+        this.#continuousTrimTimeout = setTimeout(() => {
+            if (this.#scrollDelta > 2) {
+                this.#scheduleContinuousTrim(120)
+                return
+            }
+            this.#queueContinuous(() => this.#trimContinuous())
+        }, delay)
+    }
+    #onContinuousScroll() {
+        const offset = this.#continuousStart()
+        this.#scrollDelta += Math.abs(offset - this.#prevScrollOffset)
+        this.#prevScrollOffset = offset
+        clearTimeout(this.#scrollDeltaTimeout)
+        this.#scrollDeltaTimeout = setTimeout(() => this.#scrollDelta = 0, 150)
+        this.#scheduleContinuousCheck(30)
+        this.#scheduleContinuousTrim(350)
+    }
+    #hasContinuousRecord(index) {
+        return this.#views.some(record => record.index === index)
+    }
+    async #loadContinuousRecord(index, prepend) {
+        if (!this.#canGoToIndex(index) || this.#hasContinuousRecord(index)) return null
+        this.#ensureContinuousSentinels()
+
+        const view = new View({
+            container: this,
+            onExpand: () => this.#scheduleContinuousCheck(0),
+        })
+        const record = { index, view, staged: true }
+        // Stage the wrapper out-of-flow during iframe load so it doesn't push
+        // visible content. iframe still loads and lays out (its width inherits
+        // 100% of container via absolute positioning). Caller commits to flow
+        // synchronously after load, in the same block as scroll compensation.
+        Object.assign(view.element.style, {
+            position: 'absolute',
+            top: '0',
+            left: '0',
+            visibility: 'hidden',
+            pointerEvents: 'none',
+        })
+        if (prepend) {
+            const ref = this.#views[0]?.view.element ?? this.#bottomSentinel
+            this.#container.insertBefore(view.element, ref)
+            this.#views.unshift(record)
+        } else {
+            this.#container.insertBefore(view.element, this.#bottomSentinel)
+            this.#views.push(record)
+        }
+
+        const afterLoad = doc => {
+            if (doc.head) {
+                const $styleBefore = doc.createElement('style')
+                doc.head.prepend($styleBefore)
+                const $style = doc.createElement('style')
+                doc.head.append($style)
+                this.#styleMap.set(doc, [$styleBefore, $style])
+            }
+            this.#applyStylesToDocument(doc, this.#styles)
+            this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
+        }
+        try {
+            const src = await this.sections[index].load()
+            await view.load(src, afterLoad, this.#beforeRender.bind(this))
+            this.dispatchEvent(new CustomEvent('create-overlayer', {
+                detail: {
+                    doc: view.document, index,
+                    attach: overlayer => view.overlayer = overlayer,
+                },
+            }))
+            return record
+        } catch (e) {
+            console.warn(e)
+            console.warn(new Error(`Failed to load section ${index}`))
+            this.#removeContinuousRecord(record)
+            return null
+        }
+    }
+    #commitRecordToFlow(record) {
+        if (!record || !record.staged) return
+        const el = record.view.element
+        // View wrappers must stay positioned because overlays are absolutely
+        // positioned inside them. Clearing this after continuous-mode staging
+        // makes highlights anchor to the scroller instead of the section.
+        el.style.position = 'relative'
+        el.style.top = ''
+        el.style.left = ''
+        el.style.visibility = ''
+        el.style.pointerEvents = ''
+        record.staged = false
+    }
+    async #appendContinuous(index) {
+        const record = await this.#loadContinuousRecord(index, false)
+        if (record) {
+            // Append below visible content: revealing it doesn't push the
+            // active record (it grows downward), so no scroll compensation.
+            this.#commitRecordToFlow(record)
+            if (!this.#view) {
+                this.#view = record.view
+                this.#index = record.index
+            }
+        }
+        return record
+    }
+    async #prependContinuous(index) {
+        const record = await this.#loadContinuousRecord(index, true)
+        if (!record) return null
+        const anchor = this.#views.find(r => !r.staged && r !== record)
+        if (!anchor) {
+            this.#commitRecordToFlow(record)
+            return record
+        }
+        const before = this.#recordViewportStart(anchor)
+        this.#commitRecordToFlow(record)
+        const after = this.#recordViewportStart(anchor)
+        const delta = after - before
+        if (delta) {
+            this.#container[this.scrollProp] += delta
+            this.#justAnchored = true
+        }
+        return record
+    }
+    #continuousContentLength() {
+        return this.#vertical ? this.#container.scrollWidth : this.#container.scrollHeight
+    }
+    #continuousScrollProp() {
+        return this.#vertical ? 'scrollLeft' : 'scrollTop'
+    }
+    #continuousSideProp() {
+        return this.#vertical ? 'width' : 'height'
+    }
+    #continuousSize() {
+        return this.#container.getBoundingClientRect()[this.#continuousSideProp()]
+    }
+    #continuousStart() {
+        return Math.abs(this.#container[this.#continuousScrollProp()])
+    }
+    #continuousEnd() {
+        return this.#continuousStart() + this.#continuousSize()
+    }
+    #shouldAppendContinuous() {
+        return this.#continuousStart() + this.#continuousSize() + this.#continuousPreload
+            >= this.#continuousContentLength()
+    }
+    #shouldPrependContinuous() {
+        return this.#continuousStart() <= this.#continuousPreload
+    }
+    async #checkContinuousEdges() {
+        return this.#queueContinuous(async () => {
+            if (!this.scrolled || !this.#views.length) return false
+            let changed = false
+
+            while (this.#shouldAppendContinuous()) {
+                const last = this.#views[this.#views.length - 1]
+                const next = this.#adjacentIndex(1, last.index)
+                if (next == null) break
+                const record = await this.#appendContinuous(next)
+                if (!record) break
+                changed = true
+            }
+
+            while (this.#shouldPrependContinuous()) {
+                const first = this.#views[0]
+                const prev = this.#adjacentIndex(-1, first.index)
+                if (prev == null) break
+                const record = await this.#prependContinuous(prev)
+                if (!record) break
+                changed = true
+            }
+
+            if (changed) {
+                this.#afterContinuousScroll('anchor')
+                this.#scheduleContinuousTrim(350)
+            }
+            return changed
+        })
+    }
+    #recordSize(record) {
+        return record.view.element.getBoundingClientRect()[this.#continuousSideProp()]
+    }
+    #recordOffset(record) {
+        return this.#vertical
+            ? Math.abs(record.view.element.offsetLeft)
+            : record.view.element.offsetTop
+    }
+    #recordViewportStart(record) {
+        const rect = record.view.element.getBoundingClientRect()
+        return this.#vertical ? rect.left : rect.top
+    }
+    #getRectMapperForRecord(record) {
+        return this.#getRectMapper(this.#recordSize(record), true)
+    }
+    #getLocalBounds(record) {
+        const offset = this.#recordOffset(record)
+        const size = this.#recordSize(record)
+        return {
+            size,
+            start: Math.max(0, this.#continuousStart() - offset),
+            end: Math.min(size, this.#continuousEnd() - offset),
+        }
+    }
+    async #scrollToAnchorInRecord(record, anchor, reason = 'navigation') {
+        this.#anchor = anchor
+        const target = typeof anchor === 'function'
+            ? anchor(record.view.document) : anchor
+        const rects = uncollapse(target)?.getClientRects?.()
+        if (rects) {
+            const rect = Array.from(rects)
+                .find(r => r.width > 0 && r.height > 0) || rects[0]
+            if (!rect) return
+            const recordOffset = this.#recordOffset(record)
+            const mapped = this.#getRectMapperForRecord(record)(rect).left
+            const offset = recordOffset + mapped - this.#margin
+            await this.#scrollTo(offset, reason)
+            return
+        }
+        const fraction = typeof target === 'number' ? target : 0
+        await this.#scrollTo(this.#recordOffset(record)
+            + fraction * this.#recordSize(record), reason)
+    }
+    #getActiveViewRecord() {
+        if (!this.#views.length) return null
+        const containerRect = this.#container.getBoundingClientRect()
+        let best = null
+        let bestOverlap = -1
+        let nearest = null
+        let nearestDistance = Infinity
+        const center = this.#vertical
+            ? (containerRect.left + containerRect.right) / 2
+            : (containerRect.top + containerRect.bottom) / 2
+        for (const record of this.#views) {
+            if (record.staged) continue
+            const rect = record.view.element.getBoundingClientRect()
+            const start = this.#vertical
+                ? Math.max(rect.left, containerRect.left)
+                : Math.max(rect.top, containerRect.top)
+            const end = this.#vertical
+                ? Math.min(rect.right, containerRect.right)
+                : Math.min(rect.bottom, containerRect.bottom)
+            const overlap = Math.max(0, end - start)
+            if (overlap > bestOverlap) {
+                best = record
+                bestOverlap = overlap
+            }
+            const recordCenter = this.#vertical
+                ? (rect.left + rect.right) / 2
+                : (rect.top + rect.bottom) / 2
+            const distance = Math.abs(recordCenter - center)
+            if (distance < nearestDistance) {
+                nearest = record
+                nearestDistance = distance
+            }
+        }
+        return bestOverlap > 0 ? best : nearest
+    }
+    #getVisibleRangeForRecord(record) {
+        const { start, end, size } = this.#getLocalBounds(record)
+        const from = Math.max(0, start + this.#margin)
+        const to = Math.max(from, Math.min(size, end - this.#margin))
+        return getVisibleRange(record.view.document, from, to,
+            this.#getRectMapperForRecord(record))
+    }
+    #getSectionFractionForRecord(record) {
+        const { start, size } = this.#getLocalBounds(record)
+        return size > 0 ? Math.max(0, Math.min(1, start / size)) : 0
+    }
+    #getVisibleFractionForRecord(record) {
+        const { start, end, size } = this.#getLocalBounds(record)
+        return size > 0 ? Math.max(0, Math.min(1, (end - start) / size)) : 0
+    }
+    #afterContinuousScroll(reason) {
+        const record = this.#getActiveViewRecord()
+        if (!record) return
+        const range = this.#getVisibleRangeForRecord(record)
+        this.#lastVisibleRange = range
+        if (reason !== 'selection' && reason !== 'navigation' && reason !== 'anchor')
+            this.#anchor = range
+        else this.#justAnchored = true
+
+        this.#view = record.view
+        this.#index = record.index
+        this.#background.style.background = getBackground(record.view.document)
+        this.dispatchEvent(new CustomEvent('relocate', {
+            detail: {
+                reason,
+                range,
+                index: record.index,
+                fraction: this.#getSectionFractionForRecord(record),
+                size: this.#getVisibleFractionForRecord(record),
+            },
+        }))
+    }
+    async #trimContinuous() {
+        if (!this.scrolled || this.#views.length <= this.#continuousKeepAround * 2 + 1)
+            return
+        const active = this.#getActiveViewRecord()
+        if (!active) return
+        const activeIndex = this.#views.indexOf(active)
+        // Pixel guard: only trim records that lie OUTSIDE the container's
+        // preload window. Without this, the count-based keepAround can remove
+        // short pages that are still close to the viewport, which immediately
+        // re-triggers prepend → infinite trim/prepend duel.
+        // Note: must use container viewport (not active record), because what
+        // matters is whether the record overlaps the preload zone that drives
+        // shouldPrepend/shouldAppend.
+        const sideProp = this.#continuousSideProp()
+        const containerRect = this.#container.getBoundingClientRect()
+        const cMin = sideProp === 'height' ? containerRect.top : containerRect.left
+        const cMax = sideProp === 'height' ? containerRect.bottom : containerRect.right
+        const preload = this.#continuousPreload
+        const remove = this.#views.filter((rec, index) => {
+            if (rec === active) return false
+            if (Math.abs(index - activeIndex) <= this.#continuousKeepAround) return false
+            const r = rec.view.element.getBoundingClientRect()
+            const rMin = sideProp === 'height' ? r.top : r.left
+            const rMax = sideProp === 'height' ? r.bottom : r.right
+            return rMax < cMin - preload || rMin > cMax + preload
+        })
+        if (!remove.length) return
+
+        const before = this.#recordViewportStart(active)
+        for (const record of remove) this.#removeContinuousRecord(record)
+        const after = this.#recordViewportStart(active)
+        const delta = after - before
+        this.#container[this.scrollProp] += delta
+    }
+    #removeContinuousRecord(record) {
+        const index = this.#views.indexOf(record)
+        if (index >= 0) this.#views.splice(index, 1)
+        record.view.destroy()
+        record.view.element.remove()
+        this.sections[record.index]?.unload?.()
+        if (this.#view === record.view) {
+            const active = this.#getActiveViewRecord()
+            this.#view = active?.view ?? null
+            this.#index = active?.index ?? -1
+        }
+    }
+    async #clearContinuousViews() {
+        this.#pendingContinuousAnchor = null
+        this.#disconnectContinuousObserver()
+        clearTimeout(this.#continuousCheckTimeout)
+        clearTimeout(this.#continuousTrimTimeout)
+        if (this.#continuousCheckRAF) {
+            cancelAnimationFrame(this.#continuousCheckRAF)
+            this.#continuousCheckRAF = 0
+        }
+        const records = this.#views.slice()
+        for (const record of records) this.#removeContinuousRecord(record)
+        if (this.#view) {
+            this.#view.destroy()
+            this.#view.element.remove()
+            this.sections[this.#index]?.unload?.()
+        }
+        this.#views = []
+        this.#view = null
+        this.#index = -1
+        this.#topSentinel.remove()
+        this.#bottomSentinel.remove()
     }
     #beforeRender({ vertical, rtl, background }) {
         this.#vertical = vertical
@@ -752,11 +1266,27 @@ export class Paginator extends HTMLElement {
         return { height, width, margin, gap, columnWidth }
     }
     render() {
+        if (this.scrolled && this.#views.length) {
+            const active = this.#getActiveViewRecord()
+            const anchor = this.#pendingContinuousAnchor
+                ?? (active ? this.#getVisibleRangeForRecord(active) : this.#anchor)
+            this.#pendingContinuousAnchor = null
+            for (const record of this.#views) record.view.render(this.#beforeRender({
+                vertical: this.#vertical,
+                rtl: this.#rtl,
+            }))
+            if (active) this.#scrollToAnchorInRecord(active, anchor, 'anchor')
+                .catch(e => console.warn(e))
+            this.#installContinuousObserver()
+            this.#scheduleContinuousCheck(0)
+            return
+        }
         if (!this.#view) return
-        this.#view.render(this.#beforeRender({
+        const layout = this.#beforeRender({
             vertical: this.#vertical,
             rtl: this.#rtl,
-        }))
+        })
+        this.#view.render(layout)
         this.#scrollToAnchor(this.#anchor)
     }
     get scrolled() {
@@ -776,6 +1306,8 @@ export class Paginator extends HTMLElement {
         return this.#container.getBoundingClientRect()[this.sideProp]
     }
     get viewSize() {
+        if (this.scrolled && this.#views.length)
+            return this.#continuousContentLength()
         return this.#view.element.getBoundingClientRect()[this.sideProp]
     }
     get start() {
@@ -863,9 +1395,9 @@ export class Paginator extends HTMLElement {
         })
     }
     // allows one to process rects as if they were LTR and horizontal
-    #getRectMapper() {
-        if (this.scrolled) {
-            const size = this.viewSize
+    #getRectMapper(viewSize = this.viewSize, forceScrolled = false) {
+        if (forceScrolled || this.scrolled) {
+            const size = viewSize
             const margin = this.#margin
             return this.#vertical
                 ? ({ left, right }) =>
@@ -1001,7 +1533,28 @@ export class Paginator extends HTMLElement {
     #canGoToIndex(index) {
         return index >= 0 && index <= this.sections.length - 1
     }
+    async #goToContinuous({ index, anchor, select }) {
+        if (!this.#canGoToIndex(index)) return
+        this.#locked = true
+        try {
+            await this.#clearContinuousViews()
+            this.#ensureContinuousSentinels()
+            const record = await this.#appendContinuous(index)
+            if (!record) return
+            this.#view = record.view
+            this.#index = record.index
+            this.#installContinuousObserver()
+            await this.#scrollToAnchorInRecord(record,
+                (typeof anchor === 'function' ? anchor(record.view.document) : anchor) ?? 0,
+                select ? 'selection' : 'navigation')
+            this.#afterContinuousScroll(select ? 'selection' : 'navigation')
+            this.#scheduleContinuousCheck(0)
+        } finally {
+            this.#locked = false
+        }
+    }
     async #goTo({ index, anchor, select}) {
+        if (this.scrolled) return this.#goToContinuous({ index, anchor, select })
         if (index === this.#index) await this.#display({ index, anchor, select })
         else {
             const oldIndex = this.#index
@@ -1024,22 +1577,50 @@ export class Paginator extends HTMLElement {
         const resolved = await target
         if (this.#canGoToIndex(resolved.index)) return this.#goTo(resolved)
     }
-    #scrollPrev(distance) {
+    async #scrollPrev(distance) {
         if (!this.#view) return true
         if (this.scrolled) {
-            if (this.start > 0) return this.#scrollTo(
-                Math.max(0, this.start - (distance ?? this.size)), null, true)
+            if (this.start > 0) {
+                await this.#scrollTo(
+                    Math.max(0, this.start - (distance ?? this.size)), null, true)
+                this.#scheduleContinuousCheck(0)
+                return false
+            }
+            if (this.#views.length) {
+                const first = this.#views[0]
+                const prev = this.#adjacentIndex(-1, first.index)
+                if (prev != null) {
+                    await this.#prependContinuous(prev)
+                    await this.#scrollTo(
+                        Math.max(0, this.start - (distance ?? this.size)), null, true)
+                    return false
+                }
+            }
             return true
         }
         if (this.atStart) return
         const page = this.page - 1
         return this.#scrollToPage(page, 'page', true).then(() => page <= 0)
     }
-    #scrollNext(distance) {
+    async #scrollNext(distance) {
         if (!this.#view) return true
         if (this.scrolled) {
-            if (this.viewSize - this.end > 2) return this.#scrollTo(
-                Math.min(this.viewSize, distance ? this.start + distance : this.end), null, true)
+            if (this.viewSize - this.end > 2) {
+                await this.#scrollTo(
+                    Math.min(this.viewSize, distance ? this.start + distance : this.end), null, true)
+                this.#scheduleContinuousCheck(0)
+                return false
+            }
+            if (this.#views.length) {
+                const last = this.#views[this.#views.length - 1]
+                const next = this.#adjacentIndex(1, last.index)
+                if (next != null) {
+                    await this.#appendContinuous(next)
+                    await this.#scrollTo(
+                        Math.min(this.viewSize, distance ? this.start + distance : this.end), null, true)
+                    return false
+                }
+            }
             return true
         }
         if (this.atEnd) return
@@ -1048,13 +1629,22 @@ export class Paginator extends HTMLElement {
         return this.#scrollToPage(page, 'page', true).then(() => page >= pages - 1)
     }
     get atStart() {
+        if (this.scrolled && this.#views.length) {
+            const first = this.#views[0]
+            return this.#adjacentIndex(-1, first.index) == null && this.start <= 1
+        }
         return this.#adjacentIndex(-1) == null && this.page <= 1
     }
     get atEnd() {
+        if (this.scrolled && this.#views.length) {
+            const last = this.#views[this.#views.length - 1]
+            return this.#adjacentIndex(1, last.index) == null
+                && this.#continuousContentLength() - this.end <= 2
+        }
         return this.#adjacentIndex(1) == null && this.page >= this.pages - 2
     }
-    #adjacentIndex(dir) {
-        for (let index = this.#index + dir; this.#canGoToIndex(index); index += dir)
+    #adjacentIndex(dir, from = this.#index) {
+        for (let index = from + dir; this.#canGoToIndex(index); index += dir)
             if (this.sections[index]?.linear !== 'no') return index
     }
     async #turnPage(dir, distance) {
@@ -1090,6 +1680,11 @@ export class Paginator extends HTMLElement {
         return this.goTo({ index })
     }
     getContents() {
+        if (this.scrolled && this.#views.length) return this.#views.map(({ index, view }) => ({
+            index,
+            overlayer: view.overlayer,
+            doc: view.document,
+        }))
         if (this.#view) return [{
             index: this.#index,
             overlayer: this.#view.overlayer,
@@ -1097,9 +1692,9 @@ export class Paginator extends HTMLElement {
         }]
         return []
     }
-    setStyles(styles) {
-        this.#styles = styles
-        const $$styles = this.#styleMap.get(this.#view?.document)
+    #applyStylesToDocument(doc, styles) {
+        if (!doc) return
+        const $$styles = this.#styleMap.get(doc)
         if (!$$styles) return
         const [$beforeStyle, $style] = $$styles
         if (Array.isArray(styles)) {
@@ -1107,22 +1702,47 @@ export class Paginator extends HTMLElement {
             $beforeStyle.textContent = beforeStyle
             $style.textContent = style
         } else $style.textContent = styles
+    }
+    setStyles(styles) {
+        this.#styles = styles
+        if (this.scrolled && this.#views.length) {
+            for (const { view } of this.#views) this.#applyStylesToDocument(view.document, styles)
+        } else this.#applyStylesToDocument(this.#view?.document, styles)
 
         // NOTE: needs `requestAnimationFrame` in Chromium
         requestAnimationFrame(() =>
-            this.#background.style.background = getBackground(this.#view.document))
+            this.#view
+                ? this.#background.style.background = getBackground(this.#view.document)
+                : null)
 
         // needed because the resize observer doesn't work in Firefox
-        this.#view?.document?.fonts?.ready?.then(() => this.#view.expand())
+        if (this.scrolled && this.#views.length) {
+            for (const { view } of this.#views)
+                view.document?.fonts?.ready?.then(() => view.expand())
+        } else this.#view?.document?.fonts?.ready?.then(() => this.#view.expand())
     }
     focusView() {
         this.#view.document.defaultView.focus()
     }
     destroy() {
-        this.#observer.unobserve(this)
-        this.#view.destroy()
+        clearTimeout(this.#continuousCheckTimeout)
+        clearTimeout(this.#continuousTrimTimeout)
+        clearTimeout(this.#scrollDeltaTimeout)
+        if (this.#continuousCheckRAF) {
+            cancelAnimationFrame(this.#continuousCheckRAF)
+            this.#continuousCheckRAF = 0
+        }
+        this.#disconnectContinuousObserver()
+        this.#observer.unobserve(this.#container)
+        for (const record of this.#views.slice()) this.#removeContinuousRecord(record)
+        if (this.#view) {
+            this.#view.destroy()
+            this.sections[this.#index]?.unload?.()
+        }
         this.#view = null
-        this.sections[this.#index]?.unload?.()
+        this.#views = []
+        this.#topSentinel.remove()
+        this.#bottomSentinel.remove()
         this.#mediaQuery.removeEventListener('change', this.#mediaQueryListener)
     }
 }
