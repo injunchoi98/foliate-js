@@ -432,6 +432,7 @@ export class Paginator extends HTMLElement {
     static observedAttributes = [
         'flow', 'gap', 'margin',
         'max-inline-size', 'max-block-size', 'max-column-count',
+        'max-column-count-portrait',
     ]
     #root = this.attachShadow({ mode: 'closed' })
     #observer = new ResizeObserver(() => this.render())
@@ -455,6 +456,8 @@ export class Paginator extends HTMLElement {
     #scrollBounds
     #touchState
     #touchScrolled
+    #selectionScrollOffset = null
+    #selectionScrollProp = null
     #lastVisibleRange
     #views = []
     #topSentinel = document.createElement('div')
@@ -585,6 +588,13 @@ export class Paginator extends HTMLElement {
         this.#footer = this.#root.getElementById('footer')
 
         this.#observer.observe(this.#container)
+        this.#container.addEventListener('scroll', () => {
+            const offset = this.#selectionScrollOffset
+            const scrollProp = this.#selectionScrollProp
+            if (offset === null || !scrollProp || this.scrolled) return
+            if (this.#container[scrollProp] !== offset)
+                this.#container[scrollProp] = offset
+        })
         this.#container.addEventListener('scroll', () => this.dispatchEvent(new Event('scroll')))
         this.#container.addEventListener('scroll', () => {
             if (this.scrolled && this.#views.length) this.#onContinuousScroll()
@@ -640,19 +650,48 @@ export class Paginator extends HTMLElement {
         }, 700)
         this.addEventListener('load', ({ detail: { doc } }) => {
             let isPointerSelecting = false
-            doc.addEventListener('pointerdown', () => isPointerSelecting = true)
-            doc.addEventListener('pointerup', () => isPointerSelecting = false)
+            let pointerScrollOffset = null
+            doc.addEventListener('pointerdown', () => {
+                isPointerSelecting = true
+                pointerScrollOffset = this.#container[this.scrollProp]
+                const sel = doc.getSelection()
+                if (sel?.rangeCount && !sel.isCollapsed)
+                    this.#lockSelectionScroll(pointerScrollOffset)
+            }, { capture: true })
+            const endPointerSelection = () => {
+                isPointerSelecting = false
+                const sel = doc.getSelection()
+                if (this.hasAttribute('lock-selection-scroll')
+                    && sel?.rangeCount && !sel.isCollapsed) {
+                    this.#lockSelectionScroll(pointerScrollOffset)
+                    return
+                }
+                pointerScrollOffset = null
+                this.#unlockSelectionScroll()
+            }
+            doc.addEventListener('pointerup', endPointerSelection, { capture: true })
+            doc.addEventListener('pointercancel', endPointerSelection, { capture: true })
             let isKeyboardSelecting = false
             doc.addEventListener('keydown', () => isKeyboardSelecting = true)
             doc.addEventListener('keyup', () => isKeyboardSelecting = false)
             doc.addEventListener('selectionchange', () => {
                 if (this.scrolled) return
+                const sel = doc.getSelection()
+                if (!sel?.rangeCount || sel.isCollapsed) {
+                    if (!isPointerSelecting) {
+                        pointerScrollOffset = null
+                        this.#unlockSelectionScroll()
+                    }
+                    return
+                }
+                if (this.hasAttribute('lock-selection-scroll'))
+                    this.#lockSelectionScroll(pointerScrollOffset)
                 const range = this.#lastVisibleRange
                 if (!range) return
-                const sel = doc.getSelection()
-                if (!sel.rangeCount) return
-                if (isPointerSelecting && sel.type === 'Range')
-                    checkPointerSelection(range, sel)
+                if (isPointerSelecting && sel.type === 'Range') {
+                    if (!this.hasAttribute('lock-selection-scroll'))
+                        checkPointerSelection(range, sel)
+                }
                 else if (isKeyboardSelecting) {
                     const selRange = sel.getRangeAt(0).cloneRange()
                     const backward = selectionIsBackward(sel)
@@ -684,6 +723,7 @@ export class Paginator extends HTMLElement {
             case 'margin':
             case 'max-block-size':
             case 'max-column-count':
+            case 'max-column-count-portrait':
                 this.#top.style.setProperty('--_' + name, value)
                 break
             case 'max-inline-size':
@@ -1289,6 +1329,17 @@ export class Paginator extends HTMLElement {
         this.#view.render(layout)
         this.#scrollToAnchor(this.#anchor)
     }
+    #lockSelectionScroll(offset) {
+        if (!this.hasAttribute('lock-selection-scroll') || this.scrolled) return
+        if (this.#selectionScrollOffset !== null) return
+        this.#selectionScrollProp = this.scrollProp
+        this.#selectionScrollOffset = typeof offset === 'number'
+            ? offset : this.#container[this.#selectionScrollProp]
+    }
+    #unlockSelectionScroll() {
+        this.#selectionScrollOffset = null
+        this.#selectionScrollProp = null
+    }
     get scrolled() {
         return this.getAttribute('flow') === 'scrolled'
     }
@@ -1650,14 +1701,22 @@ export class Paginator extends HTMLElement {
     async #turnPage(dir, distance) {
         if (this.#locked) return
         this.#locked = true
-        const prev = dir === -1
-        const shouldGo = await (prev ? this.#scrollPrev(distance) : this.#scrollNext(distance))
-        if (shouldGo) await this.#goTo({
-            index: this.#adjacentIndex(dir),
-            anchor: prev ? () => 1 : () => 0,
-        })
-        if (shouldGo || !this.hasAttribute('animated')) await wait(100)
-        this.#locked = false
+        try {
+            const prev = dir === -1
+            const scroll = () => prev ? this.#scrollPrev(distance) : this.#scrollNext(distance)
+            // 2026-08-09 — Keep smooth absolute-offset writes in the same queue as
+            // continuous iframe insertion, so prepend compensation cannot be overwritten.
+            const shouldGo = await (this.scrolled
+                ? this.#queueContinuous(scroll)
+                : scroll())
+            if (shouldGo) await this.#goTo({
+                index: this.#adjacentIndex(dir),
+                anchor: prev ? () => 1 : () => 0,
+            })
+            if (shouldGo || !this.hasAttribute('animated')) await wait(100)
+        } finally {
+            this.#locked = false
+        }
     }
     prev(distance) {
         return this.#turnPage(-1, distance)
