@@ -91,7 +91,7 @@ const getBoundingClientRect = target => {
     return new DOMRect(left, top, right - left, bottom - top)
 }
 
-const getVisibleRange = (doc, start, end, mapRect) => {
+const getVisibleRange = (doc, start, end, mapRect, includePartialStart = false) => {
     // first get all visible nodes
     const acceptNode = node => {
         const name = node.localName?.toLowerCase()
@@ -133,6 +133,9 @@ const getVisibleRange = (doc, start, end, mapRect) => {
         : bisectNode(doc, from, (a, b) => {
             const p = mapRect(getBoundingClientRect(a))
             const q = mapRect(getBoundingClientRect(b))
+            // A line clipped by the scroll viewport is still being read.
+            // Save its first character, rather than the end of that line.
+            if (includePartialStart) return p.right > start ? -1 : 1
             if (p.right < start && q.left > start) return 0
             return q.left > start ? -1 : 1
         })
@@ -218,6 +221,8 @@ class View {
     #column = true
     #size
     #layout = {}
+    #destroyed = false
+    #cancelLoad
     constructor({ container, onExpand }) {
         this.container = container
         this.onExpand = onExpand
@@ -251,35 +256,63 @@ class View {
         return this.#iframe.contentDocument
     }
     async load(src, afterLoad, beforeRender) {
-        if (typeof src !== 'string') throw new Error(`${src} is not string`)
-        return new Promise(resolve => {
-            this.#iframe.addEventListener('load', () => {
-                const doc = this.document
-                afterLoad?.(doc)
+        if (this.#destroyed) throw new DOMException('View destroyed', 'AbortError')
+        return new Promise((resolve, reject) => {
+            const cleanup = () => {
+                this.#iframe.removeEventListener('load', onLoad)
+                this.#iframe.removeEventListener('error', onError)
+                this.#cancelLoad = null
+            }
+            const onError = () => {
+                cleanup()
+                reject(new Error(`Failed to load ${src}`))
+            }
+            const onLoad = async () => {
+                try {
+                    const doc = this.document
+                    afterLoad?.(doc)
 
-                // it needs to be visible for Firefox to get computed style
-                this.#iframe.style.display = 'block'
-                const { vertical, rtl } = getDirection(doc)
-                const background = getBackground(doc)
-                this.#iframe.style.display = 'none'
+                    // it needs to be visible for Firefox to get computed style
+                    this.#iframe.style.display = 'block'
+                    const { vertical, rtl } = getDirection(doc)
+                    const background = getBackground(doc)
+                    this.#iframe.style.display = 'none'
 
-                this.#vertical = vertical
-                this.#rtl = rtl
+                    this.#vertical = vertical
+                    this.#rtl = rtl
 
-                this.#contentRange.selectNodeContents(doc.body)
-                const layout = beforeRender?.({ vertical, rtl, background })
-                this.#iframe.style.display = 'block'
-                this.render(layout)
-                this.#observer.observe(doc.body)
+                    this.#contentRange.selectNodeContents(doc.body)
+                    const layout = beforeRender?.({ vertical, rtl, background })
+                    this.#iframe.style.display = 'block'
+                    this.render(layout)
+                    this.#observer.observe(doc.body)
 
-                // the resize observer above doesn't work in Firefox
-                // (see https://bugzilla.mozilla.org/show_bug.cgi?id=1832939)
-                // until the bug is fixed we can at least account for font load
-                doc.fonts.ready.then(() => this.expand())
-
-                resolve()
-            }, { once: true })
-            this.#iframe.src = src
+                    // The observer misses font changes in Firefox. Await the
+                    // first font layout before resolving a saved CFI as well.
+                    await doc.fonts.ready
+                    if (this.#destroyed) return
+                    this.expand()
+                    cleanup()
+                    resolve()
+                } catch (error) {
+                    cleanup()
+                    reject(error)
+                }
+            }
+            this.#cancelLoad = () => {
+                cleanup()
+                reject(new DOMException('View destroyed', 'AbortError'))
+            }
+            Promise.resolve(src).then(value => {
+                if (this.#destroyed) return
+                if (typeof value !== 'string') throw new Error(`${value} is not string`)
+                this.#iframe.addEventListener('load', onLoad, { once: true })
+                this.#iframe.addEventListener('error', onError, { once: true })
+                this.#iframe.src = value
+            }).catch(error => {
+                cleanup()
+                reject(error)
+            })
         })
     }
     render(layout) {
@@ -359,6 +392,7 @@ class View {
         }
     }
     expand() {
+        if (this.#destroyed) return
         const { documentElement } = this.document
         if (this.#column) {
             const side = this.#vertical ? 'height' : 'width'
@@ -423,7 +457,9 @@ class View {
         return this.#overlayer
     }
     destroy() {
-        if (this.document) this.#observer.unobserve(this.document.body)
+        this.#destroyed = true
+        this.#cancelLoad?.()
+        this.#observer.disconnect()
     }
 }
 
@@ -464,6 +500,9 @@ export class Paginator extends HTMLElement {
     #bottomSentinel = document.createElement('div')
     #continuousObserver
     #continuousQueue = Promise.resolve()
+    #continuousGeneration = 0
+    #continuousNavigating = false
+    #navigationRequest = 0
     #continuousCheckTimeout
     #continuousCheckRAF = 0
     #continuousTrimTimeout
@@ -601,8 +640,8 @@ export class Paginator extends HTMLElement {
         })
         this.#container.addEventListener('scroll', debounce(() => {
             if (this.scrolled) {
-                if (this.#justAnchored) this.#justAnchored = false
-                else if (this.#views.length) this.#afterContinuousScroll('scroll')
+                if (this.#views.length) this.#afterContinuousScroll('scroll')
+                else if (this.#justAnchored) this.#justAnchored = false
                 else this.#afterScroll('scroll')
             }
         }, 250))
@@ -766,9 +805,17 @@ export class Paginator extends HTMLElement {
         return this.#view
     }
     #queueContinuous(task) {
-        const run = this.#continuousQueue.then(task, task)
+        const generation = this.#continuousGeneration
+        const runTask = () => generation === this.#continuousGeneration ? task() : undefined
+        const run = this.#continuousQueue.then(runTask, runTask)
         this.#continuousQueue = run.catch(() => {})
         return run
+    }
+    #invalidateContinuous() {
+        this.#continuousGeneration++
+        this.#continuousQueue = Promise.resolve()
+        this.#continuousNavigating = false
+        this.#locked = false
     }
     #ensureContinuousSentinels() {
         if (!this.#topSentinel.parentNode)
@@ -793,6 +840,7 @@ export class Paginator extends HTMLElement {
         this.#scheduleContinuousCheck(0)
     }
     #exitContinuous() {
+        this.#invalidateContinuous()
         this.#pendingContinuousAnchor = null
         this.#disconnectContinuousObserver()
         clearTimeout(this.#continuousCheckTimeout)
@@ -807,7 +855,7 @@ export class Paginator extends HTMLElement {
             return
         }
 
-        const active = this.#getActiveViewRecord() ?? this.#views[0]
+        const active = this.#getActiveViewRecord()
         const anchor = active ? this.#getVisibleRangeForRecord(active) : this.#anchor
         for (const record of this.#views.slice()) {
             if (record === active) continue
@@ -829,7 +877,8 @@ export class Paginator extends HTMLElement {
             this.#container.scrollLeft = 0
         }
         requestAnimationFrame(() =>
-            this.#scrollToAnchor(this.#anchor).catch(() => {}))
+            this.#view && !this.scrolled
+                ? this.#scrollToAnchor(this.#anchor).catch(() => {}) : null)
     }
     #installContinuousObserver() {
         this.#disconnectContinuousObserver()
@@ -853,6 +902,7 @@ export class Paginator extends HTMLElement {
         this.#continuousObserver = null
     }
     #scheduleContinuousCheck(delay = 30) {
+        if (!this.scrolled || this.#continuousNavigating) return
         // delay=0 means "as soon as possible" — align to the next browser
         // frame so multiple onExpand/scroll triggers within one frame coalesce
         // into a single check, and layout reads happen right before paint.
@@ -898,7 +948,7 @@ export class Paginator extends HTMLElement {
             container: this,
             onExpand: () => this.#scheduleContinuousCheck(0),
         })
-        const record = { index, view, staged: true }
+        const record = { index, view, staged: true, loaded: false }
         // Stage the wrapper out-of-flow during iframe load so it doesn't push
         // visible content. iframe still loads and lays out (its width inherits
         // 100% of container via absolute positioning). Caller commits to flow
@@ -931,8 +981,16 @@ export class Paginator extends HTMLElement {
             this.dispatchEvent(new CustomEvent('load', { detail: { doc, index } }))
         }
         try {
-            const src = await this.sections[index].load()
+            const src = Promise.resolve(this.sections[index].load()).then(src => {
+                record.loaded = true
+                // Release an abandoned load when it completes, rather than
+                // unloading before its resources have actually been created.
+                if (!this.#hasContinuousRecord(index) && this.#index !== index)
+                    this.sections[index]?.unload?.()
+                return src
+            })
             await view.load(src, afterLoad, this.#beforeRender.bind(this))
+            if (!this.#views.includes(record)) return null
             this.dispatchEvent(new CustomEvent('create-overlayer', {
                 detail: {
                     doc: view.document, index,
@@ -941,8 +999,10 @@ export class Paginator extends HTMLElement {
             }))
             return record
         } catch (e) {
-            console.warn(e)
-            console.warn(new Error(`Failed to load section ${index}`))
+            if (e.name !== 'AbortError') {
+                console.warn(e)
+                console.warn(new Error(`Failed to load section ${index}`))
+            }
             this.#removeContinuousRecord(record)
             return null
         }
@@ -962,6 +1022,7 @@ export class Paginator extends HTMLElement {
     }
     async #appendContinuous(index) {
         const record = await this.#loadContinuousRecord(index, false)
+        if (!this.#views.includes(record)) return null
         if (record) {
             // Append below visible content: revealing it doesn't push the
             // active record (it grows downward), so no scroll compensation.
@@ -975,7 +1036,7 @@ export class Paginator extends HTMLElement {
     }
     async #prependContinuous(index) {
         const record = await this.#loadContinuousRecord(index, true)
-        if (!record) return null
+        if (!record || !this.#views.includes(record)) return null
         const anchor = this.#views.find(r => !r.staged && r !== record)
         if (!anchor) {
             this.#commitRecordToFlow(record)
@@ -1018,7 +1079,8 @@ export class Paginator extends HTMLElement {
     }
     async #checkContinuousEdges() {
         return this.#queueContinuous(async () => {
-            if (!this.scrolled || !this.#views.length) return false
+            if (!this.scrolled || this.#continuousNavigating || !this.#views.length) return false
+            const generation = this.#continuousGeneration
             let changed = false
 
             while (this.#shouldAppendContinuous()) {
@@ -1026,6 +1088,7 @@ export class Paginator extends HTMLElement {
                 const next = this.#adjacentIndex(1, last.index)
                 if (next == null) break
                 const record = await this.#appendContinuous(next)
+                if (generation !== this.#continuousGeneration) return false
                 if (!record) break
                 changed = true
             }
@@ -1035,6 +1098,7 @@ export class Paginator extends HTMLElement {
                 const prev = this.#adjacentIndex(-1, first.index)
                 if (prev == null) break
                 const record = await this.#prependContinuous(prev)
+                if (generation !== this.#continuousGeneration) return false
                 if (!record) break
                 changed = true
             }
@@ -1070,24 +1134,39 @@ export class Paginator extends HTMLElement {
             end: Math.min(size, this.#continuousEnd() - offset),
         }
     }
-    async #scrollToAnchorInRecord(record, anchor, reason = 'navigation') {
-        this.#anchor = anchor
+    #getAnchorOffset(record, anchor) {
         const target = typeof anchor === 'function'
             ? anchor(record.view.document) : anchor
         const rects = uncollapse(target)?.getClientRects?.()
         if (rects) {
             const rect = Array.from(rects)
                 .find(r => r.width > 0 && r.height > 0) || rects[0]
-            if (!rect) return
+            if (!rect) return this.#recordOffset(record)
             const recordOffset = this.#recordOffset(record)
             const mapped = this.#getRectMapperForRecord(record)(rect).left
-            const offset = recordOffset + mapped - this.#margin
-            await this.#scrollTo(offset, reason)
-            return
+            return recordOffset + mapped - this.#margin
         }
         const fraction = typeof target === 'number' ? target : 0
-        await this.#scrollTo(this.#recordOffset(record)
-            + fraction * this.#recordSize(record), reason)
+        return this.#recordOffset(record) + fraction * this.#recordSize(record)
+    }
+    async #scrollToAnchorInRecord(record, anchor, reason = 'navigation') {
+        this.#anchor = anchor
+        await this.#scrollTo(this.#getAnchorOffset(record, anchor), reason)
+    }
+    async #fillContinuousViewport(record, anchor) {
+        const generation = this.#continuousGeneration
+        if (!this.#vertical && !this.#rtl) {
+            while (this.#getAnchorOffset(record, anchor) + this.#continuousSize()
+                > this.#continuousContentLength()) {
+                const last = this.#views[this.#views.length - 1]
+                const next = this.#adjacentIndex(1, last.index)
+                if (next == null) break
+                const appended = await this.#appendContinuous(next)
+                if (generation !== this.#continuousGeneration) return false
+                if (!appended) break
+            }
+        }
+        return true
     }
     #getActiveViewRecord() {
         if (!this.#views.length) return null
@@ -1109,6 +1188,14 @@ export class Paginator extends HTMLElement {
                 ? Math.min(rect.right, containerRect.right)
                 : Math.min(rect.bottom, containerRect.bottom)
             const overlap = Math.max(0, end - start)
+            // Reading resumes at the first visible section, even if only a
+            // few lines remain above a much taller following section.
+            if (!this.#vertical && !this.#rtl && overlap > 0) {
+                const range = this.#getVisibleRangeForRecord(record)
+                // A leftover margin/blank tail is not a reading position.
+                if (!range.collapsed || range.startContainer !== record.view.document.body)
+                    return record
+            }
             if (overlap > bestOverlap) {
                 best = record
                 bestOverlap = overlap
@@ -1129,7 +1216,7 @@ export class Paginator extends HTMLElement {
         const from = Math.max(0, start + this.#margin)
         const to = Math.max(from, Math.min(size, end - this.#margin))
         return getVisibleRange(record.view.document, from, to,
-            this.#getRectMapperForRecord(record))
+            this.#getRectMapperForRecord(record), !this.#vertical && !this.#rtl)
     }
     #getSectionFractionForRecord(record) {
         const { start, size } = this.#getLocalBounds(record)
@@ -1140,6 +1227,7 @@ export class Paginator extends HTMLElement {
         return size > 0 ? Math.max(0, Math.min(1, (end - start) / size)) : 0
     }
     #afterContinuousScroll(reason) {
+        if (this.#continuousNavigating) return
         const record = this.#getActiveViewRecord()
         if (!record) return
         const range = this.#getVisibleRangeForRecord(record)
@@ -1197,17 +1285,18 @@ export class Paginator extends HTMLElement {
     }
     #removeContinuousRecord(record) {
         const index = this.#views.indexOf(record)
-        if (index >= 0) this.#views.splice(index, 1)
+        if (index < 0) return
+        this.#views.splice(index, 1)
         record.view.destroy()
         record.view.element.remove()
-        this.sections[record.index]?.unload?.()
+        if (record.loaded !== false) this.sections[record.index]?.unload?.()
         if (this.#view === record.view) {
             const active = this.#getActiveViewRecord()
             this.#view = active?.view ?? null
             this.#index = active?.index ?? -1
         }
     }
-    async #clearContinuousViews() {
+    #clearContinuousViews() {
         this.#pendingContinuousAnchor = null
         this.#disconnectContinuousObserver()
         clearTimeout(this.#continuousCheckTimeout)
@@ -1308,15 +1397,30 @@ export class Paginator extends HTMLElement {
     render() {
         if (this.scrolled && this.#views.length) {
             const active = this.#getActiveViewRecord()
+            const entering = this.#pendingContinuousAnchor !== null
             const anchor = this.#pendingContinuousAnchor
                 ?? (active ? this.#getVisibleRangeForRecord(active) : this.#anchor)
             this.#pendingContinuousAnchor = null
-            for (const record of this.#views) record.view.render(this.#beforeRender({
+            if (entering && active) this.#continuousNavigating = true
+            for (const record of this.#views.filter(record => !record.staged)) record.view.render(this.#beforeRender({
                 vertical: this.#vertical,
                 rtl: this.#rtl,
             }))
-            if (active) this.#scrollToAnchorInRecord(active, anchor, 'anchor')
-                .catch(e => console.warn(e))
+            if (entering && active) this.#queueContinuous(async () => {
+                const generation = this.#continuousGeneration
+                try {
+                    if (!await this.#fillContinuousViewport(active, anchor)) return
+                    this.#continuousNavigating = false
+                    await this.#scrollToAnchorInRecord(active, anchor, 'anchor')
+                } finally {
+                    if (generation === this.#continuousGeneration) {
+                        this.#continuousNavigating = false
+                        this.#scheduleContinuousCheck(0)
+                    }
+                }
+            }).catch(e => console.warn(e))
+            else if (active && !this.#continuousNavigating)
+                this.#scrollToAnchorInRecord(active, anchor, 'anchor').catch(e => console.warn(e))
             this.#installContinuousObserver()
             this.#scheduleContinuousCheck(0)
             return
@@ -1474,6 +1578,7 @@ export class Paginator extends HTMLElement {
     async #scrollTo(offset, reason, smooth) {
         const element = this.#container
         const { scrollProp, size } = this
+        const generation = this.#continuousGeneration
         if (element[scrollProp] === offset) {
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
@@ -1483,8 +1588,11 @@ export class Paginator extends HTMLElement {
         if (this.scrolled && this.#vertical) offset = -offset
         if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) return animate(
             element[scrollProp], offset, 300, easeOutQuad,
-            x => element[scrollProp] = x,
+            x => {
+                if (generation === this.#continuousGeneration) element[scrollProp] = x
+            },
         ).then(() => {
+            if (generation !== this.#continuousGeneration) return
             this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
         })
@@ -1502,6 +1610,14 @@ export class Paginator extends HTMLElement {
         return this.#scrollToAnchor(anchor, select ? 'selection' : 'navigation')
     }
     async #scrollToAnchor(anchor, reason = 'anchor') {
+        if (this.scrolled && this.#views.length) {
+            const doc = anchor?.startContainer?.ownerDocument ?? anchor?.ownerDocument
+            const record = doc
+                ? this.#views.find(record => !record.staged && record.view.document === doc)
+                : this.#getActiveViewRecord()
+            if (record) return this.#scrollToAnchorInRecord(record, anchor, reason)
+            return
+        }
         this.#anchor = anchor
         const rects = uncollapse(anchor)?.getClientRects?.()
         // if anchor is an element or a range
@@ -1533,6 +1649,8 @@ export class Paginator extends HTMLElement {
             this.start - size, this.end - size, this.#getRectMapper())
     }
     #afterScroll(reason) {
+        if (this.scrolled && this.#views.length) return this.#afterContinuousScroll(reason)
+        if (!this.#view) return
         const range = this.#getVisibleRange()
         this.#lastVisibleRange = range
         // don't set new anchor if relocation was to scroll to anchor
@@ -1550,6 +1668,9 @@ export class Paginator extends HTMLElement {
             detail.size = 1 / (pages - 2)
         }
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
+    }
+    reportLocation() {
+        if (this.scrolled) this.#afterContinuousScroll('scroll')
     }
     async #display(promise) {
         const { index, src, anchor, onLoad, select } = await promise
@@ -1586,22 +1707,33 @@ export class Paginator extends HTMLElement {
     }
     async #goToContinuous({ index, anchor, select }) {
         if (!this.#canGoToIndex(index)) return
+        this.#invalidateContinuous()
+        const generation = this.#continuousGeneration
         this.#locked = true
+        this.#continuousNavigating = true
         try {
-            await this.#clearContinuousViews()
+            this.#clearContinuousViews()
             this.#ensureContinuousSentinels()
             const record = await this.#appendContinuous(index)
-            if (!record) return
+            if (!record || generation !== this.#continuousGeneration) return
+            const target = (typeof anchor === 'function' ? anchor(record.view.document) : anchor) ?? 0
+            // Without enough content below the CFI the browser clamps the
+            // initial scroll offset. Fill the visible area before publishing
+            // the position; the larger preload buffer can load afterwards.
+            if (!await this.#fillContinuousViewport(record, target)) return
+            if (generation !== this.#continuousGeneration) return
             this.#view = record.view
             this.#index = record.index
             this.#installContinuousObserver()
-            await this.#scrollToAnchorInRecord(record,
-                (typeof anchor === 'function' ? anchor(record.view.document) : anchor) ?? 0,
+            this.#continuousNavigating = false
+            await this.#scrollToAnchorInRecord(record, target,
                 select ? 'selection' : 'navigation')
-            this.#afterContinuousScroll(select ? 'selection' : 'navigation')
-            this.#scheduleContinuousCheck(0)
         } finally {
-            this.#locked = false
+            if (generation === this.#continuousGeneration) {
+                this.#continuousNavigating = false
+                this.#locked = false
+                this.#scheduleContinuousCheck(0)
+            }
         }
     }
     async #goTo({ index, anchor, select}) {
@@ -1624,12 +1756,15 @@ export class Paginator extends HTMLElement {
         }
     }
     async goTo(target) {
-        if (this.#locked) return
+        if (this.#locked && !this.scrolled) return
+        const request = ++this.#navigationRequest
         const resolved = await target
+        if (request !== this.#navigationRequest) return
         if (this.#canGoToIndex(resolved.index)) return this.#goTo(resolved)
     }
     async #scrollPrev(distance) {
         if (!this.#view) return true
+        const generation = this.#continuousGeneration
         if (this.scrolled) {
             if (this.start > 0) {
                 await this.#scrollTo(
@@ -1641,7 +1776,8 @@ export class Paginator extends HTMLElement {
                 const first = this.#views[0]
                 const prev = this.#adjacentIndex(-1, first.index)
                 if (prev != null) {
-                    await this.#prependContinuous(prev)
+                    const record = await this.#prependContinuous(prev)
+                    if (!record || generation !== this.#continuousGeneration) return false
                     await this.#scrollTo(
                         Math.max(0, this.start - (distance ?? this.size)), null, true)
                     return false
@@ -1655,6 +1791,7 @@ export class Paginator extends HTMLElement {
     }
     async #scrollNext(distance) {
         if (!this.#view) return true
+        const generation = this.#continuousGeneration
         if (this.scrolled) {
             if (this.viewSize - this.end > 2) {
                 await this.#scrollTo(
@@ -1666,7 +1803,8 @@ export class Paginator extends HTMLElement {
                 const last = this.#views[this.#views.length - 1]
                 const next = this.#adjacentIndex(1, last.index)
                 if (next != null) {
-                    await this.#appendContinuous(next)
+                    const record = await this.#appendContinuous(next)
+                    if (!record || generation !== this.#continuousGeneration) return false
                     await this.#scrollTo(
                         Math.min(this.viewSize, distance ? this.start + distance : this.end), null, true)
                     return false
@@ -1700,6 +1838,7 @@ export class Paginator extends HTMLElement {
     }
     async #turnPage(dir, distance) {
         if (this.#locked) return
+        const generation = this.#continuousGeneration
         this.#locked = true
         try {
             const prev = dir === -1
@@ -1709,13 +1848,14 @@ export class Paginator extends HTMLElement {
             const shouldGo = await (this.scrolled
                 ? this.#queueContinuous(scroll)
                 : scroll())
+            if (generation !== this.#continuousGeneration) return
             if (shouldGo) await this.#goTo({
                 index: this.#adjacentIndex(dir),
                 anchor: prev ? () => 1 : () => 0,
             })
             if (shouldGo || !this.hasAttribute('animated')) await wait(100)
         } finally {
-            this.#locked = false
+            if (generation === this.#continuousGeneration) this.#locked = false
         }
     }
     prev(distance) {
@@ -1778,12 +1918,17 @@ export class Paginator extends HTMLElement {
         if (this.scrolled && this.#views.length) {
             for (const { view } of this.#views)
                 view.document?.fonts?.ready?.then(() => view.expand())
-        } else this.#view?.document?.fonts?.ready?.then(() => this.#view.expand())
+        } else {
+            const view = this.#view
+            view?.document?.fonts?.ready?.then(() => view.expand())
+        }
     }
     focusView() {
         this.#view.document.defaultView.focus()
     }
     destroy() {
+        this.#navigationRequest++
+        this.#invalidateContinuous()
         clearTimeout(this.#continuousCheckTimeout)
         clearTimeout(this.#continuousTrimTimeout)
         clearTimeout(this.#scrollDeltaTimeout)
