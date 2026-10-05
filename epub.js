@@ -325,14 +325,12 @@ const getMetadata = (opf) => {
     subject: dc.subject?.map(makeContributor),
     belongsTo: {
       collection: belongsTo.collection?.map(makeCollection),
-      series:
-        (belongsTo.series?.map(makeCollection) ??
-        legacyMeta?.["calibre:series"])
-          ? {
+      series: belongsTo.series?.map(makeCollection) ??
+        (legacyMeta?.["calibre:series"] ? {
               name: legacyMeta?.["calibre:series"],
               position: parseFloat(legacyMeta?.["calibre:series_index"]),
             }
-          : null,
+          : null),
     },
     altIdentifier: dc.identifier?.map(makeAltIdentifier),
     source: dc.source?.map(makeAltIdentifier), // NOTE: not in webpub schema
