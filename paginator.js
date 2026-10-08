@@ -218,6 +218,8 @@ class View {
     #overlayer
     #vertical = false
     #rtl = false
+    #textDirection
+    #rootStyles
     #column = true
     #size
     #layout = {}
@@ -276,6 +278,13 @@ class View {
                     this.#iframe.style.display = 'block'
                     const { vertical, rtl } = getDirection(doc)
                     const background = getBackground(doc)
+                    const rootStyle = doc.defaultView.getComputedStyle(doc.documentElement)
+                    this.#rootStyles = {
+                        direction: rootStyle.direction,
+                        'writing-mode': rootStyle.writingMode,
+                        contain: rootStyle.contain,
+                    }
+                    this.#textDirection = doc.defaultView.getComputedStyle(doc.body).direction
                     this.#iframe.style.display = 'none'
 
                     this.#vertical = vertical
@@ -316,9 +325,20 @@ class View {
         })
     }
     render(layout) {
-        if (!layout) return
+        if (!layout || !this.#rootStyles) return
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
+        this.#rtl = layout.rtl ?? this.#rtl
+        if (!this.#vertical) {
+            // Containment stops body's bidi direction from also controlling the columns.
+            setStylesImportant(this.document.documentElement, this.#column ? {
+                direction: this.#rtl ? 'rtl' : 'ltr',
+                'writing-mode': 'horizontal-tb',
+                contain: this.#rtl !== (this.#textDirection === 'rtl')
+                    && this.#rootStyles.contain === 'none' ? 'style' : this.#rootStyles.contain,
+            } : this.#rootStyles)
+            setStylesImportant(this.document.body, { direction: this.#textDirection })
+        }
         if (this.#column) this.columnize(layout)
         else this.scrolled(layout)
     }
@@ -1318,6 +1338,9 @@ export class Paginator extends HTMLElement {
         this.#bottomSentinel.remove()
     }
     #beforeRender({ vertical, rtl, background }) {
+        const flow = this.getAttribute('flow')
+        if (flow !== 'scrolled' && !vertical && ['ltr', 'rtl'].includes(this.bookDir))
+            rtl = this.bookDir === 'rtl'
         this.#vertical = vertical
         this.#rtl = rtl
         this.#top.classList.toggle('vertical', vertical)
@@ -1355,7 +1378,6 @@ export class Paginator extends HTMLElement {
         // So we apply the inverse, f⁻¹ = -x / (x - 1) to the column gap.
         const gap = -g / (g - 1) * size
 
-        const flow = this.getAttribute('flow')
         // Continuous vertical writing places chapters next to each other,
         // starting at the right edge, rather than stacking them below it.
         this.#container.style.display = flow === 'scrolled' && vertical ? 'flex' : ''
@@ -1371,7 +1393,7 @@ export class Paginator extends HTMLElement {
             this.#header.replaceChildren()
             this.#footer.replaceChildren()
 
-            return { flow, margin, gap, columnWidth }
+            return { flow, margin, gap, columnWidth, rtl }
         }
 
         const divisor = Math.min(maxColumnCount, Math.ceil(size / maxInlineSize))
@@ -1395,7 +1417,7 @@ export class Paginator extends HTMLElement {
         this.#header.replaceChildren(...heads)
         this.#footer.replaceChildren(...feet)
 
-        return { height, width, margin, gap, columnWidth }
+        return { height, width, margin, gap, columnWidth, rtl }
     }
     render() {
         if (this.scrolled && this.#views.length) {
@@ -1405,10 +1427,8 @@ export class Paginator extends HTMLElement {
                 ?? (active ? this.#getVisibleRangeForRecord(active) : this.#anchor)
             this.#pendingContinuousAnchor = null
             if (entering && active) this.#continuousNavigating = true
-            for (const record of this.#views.filter(record => !record.staged)) record.view.render(this.#beforeRender({
-                vertical: this.#vertical,
-                rtl: this.#rtl,
-            }))
+            for (const record of this.#views.filter(record => !record.staged))
+                record.view.render(this.#beforeRender(getDirection(record.view.document)))
             if (entering && active) this.#queueContinuous(async () => {
                 const generation = this.#continuousGeneration
                 try {
@@ -1428,11 +1448,8 @@ export class Paginator extends HTMLElement {
             this.#scheduleContinuousCheck(0)
             return
         }
-        if (!this.#view) return
-        const layout = this.#beforeRender({
-            vertical: this.#vertical,
-            rtl: this.#rtl,
-        })
+        if (!this.#view?.document?.body) return
+        const layout = this.#beforeRender(getDirection(this.#view.document))
         this.#view.render(layout)
         this.#scrollToAnchor(this.#anchor)
     }
