@@ -1115,7 +1115,8 @@ export class Paginator extends HTMLElement {
     }
     #recordOffset(record) {
         return this.#vertical
-            ? Math.abs(record.view.element.offsetLeft)
+            ? this.#continuousStart() + this.#container.getBoundingClientRect().right
+                - record.view.element.getBoundingClientRect().right
             : record.view.element.offsetTop
     }
     #recordViewportStart(record) {
@@ -1155,16 +1156,14 @@ export class Paginator extends HTMLElement {
     }
     async #fillContinuousViewport(record, anchor) {
         const generation = this.#continuousGeneration
-        if (!this.#vertical && !this.#rtl) {
-            while (this.#getAnchorOffset(record, anchor) + this.#continuousSize()
-                > this.#continuousContentLength()) {
-                const last = this.#views[this.#views.length - 1]
-                const next = this.#adjacentIndex(1, last.index)
-                if (next == null) break
-                const appended = await this.#appendContinuous(next)
-                if (generation !== this.#continuousGeneration) return false
-                if (!appended) break
-            }
+        while (this.#getAnchorOffset(record, anchor) + this.#continuousSize()
+            > this.#continuousContentLength()) {
+            const last = this.#views[this.#views.length - 1]
+            const next = this.#adjacentIndex(1, last.index)
+            if (next == null) break
+            const appended = await this.#appendContinuous(next)
+            if (generation !== this.#continuousGeneration) return false
+            if (!appended) break
         }
         return true
     }
@@ -1190,7 +1189,7 @@ export class Paginator extends HTMLElement {
             const overlap = Math.max(0, end - start)
             // Reading resumes at the first visible section, even if only a
             // few lines remain above a much taller following section.
-            if (!this.#vertical && !this.#rtl && overlap > 0) {
+            if (overlap > 0) {
                 const range = this.#getVisibleRangeForRecord(record)
                 // A leftover margin/blank tail is not a reading position.
                 if (!range.collapsed || range.startContainer !== record.view.document.body)
@@ -1216,7 +1215,7 @@ export class Paginator extends HTMLElement {
         const from = Math.max(0, start + this.#margin)
         const to = Math.max(from, Math.min(size, end - this.#margin))
         return getVisibleRange(record.view.document, from, to,
-            this.#getRectMapperForRecord(record), !this.#vertical && !this.#rtl)
+            this.#getRectMapperForRecord(record), true)
     }
     #getSectionFractionForRecord(record) {
         const { start, size } = this.#getLocalBounds(record)
@@ -1357,6 +1356,10 @@ export class Paginator extends HTMLElement {
         const gap = -g / (g - 1) * size
 
         const flow = this.getAttribute('flow')
+        // Continuous vertical writing places chapters next to each other,
+        // starting at the right edge, rather than stacking them below it.
+        this.#container.style.display = flow === 'scrolled' && vertical ? 'flex' : ''
+        this.#topSentinel.style.flexShrink = this.#bottomSentinel.style.flexShrink = '0'
         if (flow === 'scrolled') {
             // FIXME: vertical-rl only, not -lr
             this.setAttribute('dir', vertical ? 'rtl' : 'ltr')
