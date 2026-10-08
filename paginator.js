@@ -46,8 +46,8 @@ const uncollapse = range => {
         if (node?.nodeType === 1) return node
         return endContainer
     }
-    if (endOffset + 1 < endContainer.length) range.setEnd(endContainer, endOffset + 1)
-    else if (endOffset > 1) range.setStart(endContainer, endOffset - 1)
+    if (endOffset < endContainer.length) range.setEnd(endContainer, endOffset + 1)
+    else if (endOffset > 0) range.setStart(endContainer, endOffset - 1)
     else return endContainer.parentNode
     return range
 }
