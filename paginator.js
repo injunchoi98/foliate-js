@@ -91,7 +91,7 @@ const getBoundingClientRect = target => {
     return new DOMRect(left, top, right - left, bottom - top)
 }
 
-const getVisibleRange = (doc, start, end, mapRect, includePartialStart = false) => {
+const getVisibleRange = (doc, start, end, mapRect, includePartialStart = false, strict = false) => {
     // first get all visible nodes
     const acceptNode = node => {
         const name = node.localName?.toLowerCase()
@@ -100,7 +100,8 @@ const getVisibleRange = (doc, start, end, mapRect, includePartialStart = false) 
         if (node.nodeType === 1) {
             const { left, right } = mapRect(node.getBoundingClientRect())
             // no need to check child nodes if it's completely out of view
-            if (right < start || left > end) return FILTER_REJECT
+            // Touching a page edge does not make the previous page's text visible.
+            if (right <= start || left >= end) return FILTER_REJECT
             // elements must be completely in view to be considered visible
             // because you can't specify offsets for elements
             if (left >= start && right <= end) return FILTER_ACCEPT
@@ -115,7 +116,7 @@ const getVisibleRange = (doc, start, end, mapRect, includePartialStart = false) 
             range.selectNodeContents(node)
             const { left, right } = mapRect(range.getBoundingClientRect())
             // it's visible if any part of it is in view
-            if (right >= start && left <= end) return FILTER_ACCEPT
+            if (right > start && left < end) return FILTER_ACCEPT
         }
         return FILTER_SKIP
     }
@@ -131,7 +132,7 @@ const getVisibleRange = (doc, start, end, mapRect, includePartialStart = false) 
     // find the offset at which visibility changes
     const startOffset = from.nodeType === 1 ? 0
         : bisectNode(doc, from, (a, b) => {
-            const p = mapRect(getBoundingClientRect(a))
+            const p = mapRect(getBoundingClientRect(includePartialStart ? uncollapse(a) : a))
             const q = mapRect(getBoundingClientRect(b))
             // A line clipped by the scroll viewport is still being read.
             // Save its first character, rather than the end of that line.
@@ -143,6 +144,7 @@ const getVisibleRange = (doc, start, end, mapRect, includePartialStart = false) 
         : bisectNode(doc, to, (a, b) => {
             const p = mapRect(getBoundingClientRect(a))
             const q = mapRect(getBoundingClientRect(b))
+            if (strict) return q.left < end ? 1 : -1
             if (p.right < end && q.left > end) return 0
             return q.left > end ? -1 : 1
         })
@@ -186,7 +188,7 @@ const getDirection = doc => {
     const rtl = doc.body.dir === 'rtl'
         || direction === 'rtl'
         || doc.documentElement.dir === 'rtl'
-    return { vertical, rtl }
+    return { vertical, rtl, writingMode, textDirection: direction }
 }
 
 const getBackground = doc => {
@@ -220,6 +222,8 @@ class View {
     #rtl = false
     #textDirection
     #rootStyles
+    #sourceStyles
+    #writingMode
     #column = true
     #size
     #layout = {}
@@ -273,25 +277,22 @@ class View {
                 try {
                     const doc = this.document
                     afterLoad?.(doc)
+                    this.#sourceStyles = new Map([
+                        doc.documentElement, doc.body, ...doc.body.querySelectorAll('img, svg, video'),
+                    ].map(el => [el, el.style.cssText]))
 
                     // it needs to be visible for Firefox to get computed style
                     this.#iframe.style.display = 'block'
-                    const { vertical, rtl } = getDirection(doc)
+                    const direction = this.refreshLayout()
+                    const { vertical, rtl } = direction
                     const background = getBackground(doc)
-                    const rootStyle = doc.defaultView.getComputedStyle(doc.documentElement)
-                    this.#rootStyles = {
-                        direction: rootStyle.direction,
-                        'writing-mode': rootStyle.writingMode,
-                        contain: rootStyle.contain,
-                    }
-                    this.#textDirection = doc.defaultView.getComputedStyle(doc.body).direction
                     this.#iframe.style.display = 'none'
 
                     this.#vertical = vertical
                     this.#rtl = rtl
 
                     this.#contentRange.selectNodeContents(doc.body)
-                    const layout = beforeRender?.({ vertical, rtl, background })
+                    const layout = beforeRender?.({ ...direction, background })
                     this.#iframe.style.display = 'block'
                     this.render(layout)
                     this.#observer.observe(doc.body)
@@ -324,20 +325,44 @@ class View {
             })
         })
     }
+    refreshLayout() {
+        for (const [el, css] of this.#sourceStyles) el.style.cssText = css
+        this.#iframe.style.width = this.#iframe.style.height = '100%'
+        this.#element.style.width = this.#element.style.height = '100%'
+        const doc = this.document
+        const direction = getDirection(doc)
+        this.#vertical = direction.vertical
+        this.#rtl = direction.rtl
+        this.#writingMode = direction.writingMode
+        this.#textDirection = doc.defaultView.getComputedStyle(doc.body).direction
+        const style = doc.defaultView.getComputedStyle(doc.documentElement)
+        this.#rootStyles = {
+            direction: style.direction, 'writing-mode': style.writingMode, contain: style.contain,
+        }
+        return direction
+    }
     render(layout) {
         if (!layout || !this.#rootStyles) return
         this.#column = layout.flow !== 'scrolled'
         this.#layout = layout
+        const changedDirection = layout.rtl != null && layout.rtl !== this.#rtl
         this.#rtl = layout.rtl ?? this.#rtl
-        if (!this.#vertical) {
+        const verticalRtl = this.#textDirection === 'rtl' && this.#writingMode === 'vertical-rl'
+        if (!this.#vertical || verticalRtl) {
+            const rtl = this.#rtl && !verticalRtl
             // Containment stops body's bidi direction from also controlling the columns.
             setStylesImportant(this.document.documentElement, this.#column ? {
-                direction: this.#rtl ? 'rtl' : 'ltr',
-                'writing-mode': 'horizontal-tb',
-                contain: this.#rtl !== (this.#textDirection === 'rtl')
+                direction: rtl ? 'rtl' : 'ltr',
+                'writing-mode': verticalRtl ? this.#writingMode : 'horizontal-tb',
+                contain: rtl !== (this.#textDirection === 'rtl')
                     && this.#rootStyles.contain === 'none' ? 'style' : this.#rootStyles.contain,
             } : this.#rootStyles)
             setStylesImportant(this.document.body, { direction: this.#textDirection })
+        }
+        if (changedDirection && this.#column) {
+            // Invalidate columns before measuring the opposite progression direction.
+            this.document.documentElement.style.setProperty('column-width', 'auto', 'important')
+            this.document.body.getBoundingClientRect()
         }
         if (this.#column) this.columnize(layout)
         else this.scrolled(layout)
@@ -437,6 +462,7 @@ class View {
                 this.#overlayer.element.style.left = this.#vertical ? '0' : `${this.#size}px`
                 this.#overlayer.element.style.top = this.#vertical ? `${this.#size}px` : '0'
                 this.#overlayer.element.style[side] = `${expandedSize}px`
+                this.#overlayer.element.style[otherSide] = '100%'
                 this.#overlayer.redraw()
             }
         } else {
@@ -500,6 +526,8 @@ export class Paginator extends HTMLElement {
     #view
     #vertical = false
     #rtl = false
+    #verticalRtl = false
+    #reflowing = false
     #margin = 0
     #index = -1
     #anchor = 0 // anchor view to a fraction (0-1), Range, or Element
@@ -660,7 +688,7 @@ export class Paginator extends HTMLElement {
         })
         this.#container.addEventListener('scroll', debounce(() => {
             if (this.scrolled) {
-                if (this.#views.length) this.#afterContinuousScroll('scroll')
+                if (this.#views.length) this.reportLocation()
                 else if (this.#justAnchored) this.#justAnchored = false
                 else this.#afterScroll('scroll')
             }
@@ -819,7 +847,7 @@ export class Paginator extends HTMLElement {
         }
         this.#view = new View({
             container: this,
-            onExpand: () => this.#scrollToAnchor(this.#anchor),
+            onExpand: () => this.#reflowing ? null : this.#scrollToAnchor(this.#anchor),
         })
         this.#container.append(this.#view.element)
         return this.#view
@@ -1337,12 +1365,13 @@ export class Paginator extends HTMLElement {
         this.#topSentinel.remove()
         this.#bottomSentinel.remove()
     }
-    #beforeRender({ vertical, rtl, background }) {
+    #beforeRender({ vertical, rtl, writingMode, textDirection, background }) {
         const flow = this.getAttribute('flow')
         if (flow !== 'scrolled' && !vertical && ['ltr', 'rtl'].includes(this.bookDir))
             rtl = this.bookDir === 'rtl'
         this.#vertical = vertical
         this.#rtl = rtl
+        this.#verticalRtl = textDirection === 'rtl' && writingMode === 'vertical-rl'
         this.#top.classList.toggle('vertical', vertical)
 
         // set background to `doc` background
@@ -1419,7 +1448,53 @@ export class Paginator extends HTMLElement {
 
         return { height, width, margin, gap, columnWidth, rtl }
     }
+    async reflow(update, refreshAxes = false) {
+        const run = async () => {
+            if (!this.#view) return
+            if (this.scrolled && this.start !== Math.abs(this.#scrollBounds?.[0] ?? 0))
+                this.reportLocation()
+            const position = {
+                index: this.#index,
+                anchor: this.#anchor?.cloneRange?.() ?? this.#anchor,
+            }
+            position.anchor?.collapse?.(true)
+            this.#reflowing = true
+            const continuous = this.scrolled && this.#views.length
+            if (continuous) this.#continuousNavigating = true
+            try {
+                // No rAF here: DOM edits, layout reads and the first anchor scroll stay synchronous to avoid an intermediate paint.
+                const target = update(position) ?? position
+                const views = continuous ? this.#views.filter(record => !record.staged)
+                    : [{ index: this.#index, view: this.#view }]
+                if (refreshAxes) {
+                    for (const { view } of views) view.refreshLayout()
+                    this.#container.scrollTop = this.#container.scrollLeft = 0
+                }
+                for (const { view } of views)
+                    view.render(this.#beforeRender(getDirection(view.document)))
+                const record = views.find(record => record.index === target.index)
+                if (!record) throw new Error('Reading anchor document was unloaded')
+                const anchor = typeof target.anchor === 'function'
+                    ? target.anchor(record.view.document) : target.anchor
+                if (continuous) {
+                    await this.#scrollToAnchorInRecord(record, anchor, 'anchor')
+                    if (!await this.#fillContinuousViewport(record, anchor)) return
+                    this.#continuousNavigating = false
+                    await this.#scrollToAnchorInRecord(record, anchor, 'anchor')
+                } else await this.#scrollToAnchor(anchor)
+            } finally {
+                this.#reflowing = false
+                if (continuous) {
+                    this.#continuousNavigating = false
+                    this.#installContinuousObserver()
+                    this.#scheduleContinuousCheck(0)
+                }
+            }
+        }
+        return this.scrolled ? this.#queueContinuous(run) : run()
+    }
     render() {
+        if (this.#reflowing) return
         if (this.scrolled && this.#views.length) {
             const active = this.#getActiveViewRecord()
             const entering = this.#pendingContinuousAnchor !== null
@@ -1467,6 +1542,10 @@ export class Paginator extends HTMLElement {
     get scrolled() {
         return this.getAttribute('flow') === 'scrolled'
     }
+    get #rtlScroll() {
+        // Only vertical-rl RTL pagination uses positive scrollTop instead of RTL scrollLeft.
+        return this.#rtl && (this.scrolled || !this.#verticalRtl)
+    }
     get scrollProp() {
         const { scrolled } = this
         return this.#vertical ? (scrolled ? 'scrollLeft' : 'scrollTop')
@@ -1502,7 +1581,7 @@ export class Paginator extends HTMLElement {
         const element = this.#container
         const { scrollProp } = this
         const [offset, a, b] = this.#scrollBounds
-        const rtl = this.#rtl
+        const rtl = this.#rtlScroll
         const min = rtl ? offset - b : offset - a
         const max = rtl ? offset + a : offset + b
         element[scrollProp] = Math.max(min, Math.min(max,
@@ -1514,7 +1593,7 @@ export class Paginator extends HTMLElement {
         const { start, end, pages, size } = this
         const min = Math.abs(offset) - a
         const max = Math.abs(offset) + b
-        const d = velocity * (this.#rtl ? -size : size)
+        const d = velocity * (this.#rtlScroll ? -size : size)
         const page = Math.floor(
             Math.max(min, Math.min(max, (start + end) / 2
                 + (isNaN(d) ? 0 : d))) / size)
@@ -1580,7 +1659,7 @@ export class Paginator extends HTMLElement {
                 : ({ top, bottom }) => ({ left: top + margin, right: bottom + margin })
         }
         const pxSize = this.pages * this.size
-        return this.#rtl
+        return this.#rtlScroll
             ? ({ left, right }) =>
                 ({ left: pxSize - right, right: pxSize - left })
             : this.#vertical
@@ -1593,14 +1672,14 @@ export class Paginator extends HTMLElement {
             return this.#scrollTo(offset, reason)
         }
         const offset = this.#getRectMapper()(rect).left
-        return this.#scrollToPage(Math.floor(offset / this.size) + (this.#rtl ? -1 : 1), reason)
+        return this.#scrollToPage(Math.floor(offset / this.size) + (this.#rtlScroll ? -1 : 1), reason)
     }
     async #scrollTo(offset, reason, smooth) {
         const element = this.#container
         const { scrollProp, size } = this
         const generation = this.#continuousGeneration
         if (element[scrollProp] === offset) {
-            this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
+            this.#scrollBounds = [element[scrollProp], this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
             return
         }
@@ -1613,17 +1692,17 @@ export class Paginator extends HTMLElement {
             },
         ).then(() => {
             if (generation !== this.#continuousGeneration) return
-            this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
+            this.#scrollBounds = [element[scrollProp], this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
         })
         else {
             element[scrollProp] = offset
-            this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
+            this.#scrollBounds = [element[scrollProp], this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
         }
     }
     async #scrollToPage(page, reason, smooth) {
-        const offset = this.size * (this.#rtl ? -page : page)
+        const offset = this.size * (this.#rtlScroll ? -page : page)
         return this.#scrollTo(offset, reason, smooth)
     }
     async scrollToAnchor(anchor, select) {
@@ -1664,9 +1743,10 @@ export class Paginator extends HTMLElement {
     #getVisibleRange() {
         if (this.scrolled) return getVisibleRange(this.#view.document,
             this.start + this.#margin, this.end - this.#margin, this.#getRectMapper())
-        const size = this.#rtl ? -this.size : this.size
+        const size = this.#rtlScroll ? -this.size : this.size
         return getVisibleRange(this.#view.document,
-            this.start - size, this.end - size, this.#getRectMapper())
+            this.start - size, this.end - size, this.#getRectMapper(),
+            true, this.#verticalRtl)
     }
     #afterScroll(reason) {
         if (this.scrolled && this.#views.length) return this.#afterContinuousScroll(reason)
@@ -1690,7 +1770,8 @@ export class Paginator extends HTMLElement {
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
     }
     reportLocation() {
-        if (this.scrolled) this.#afterContinuousScroll('scroll')
+        if (this.scrolled) this.#afterContinuousScroll(
+            this.start === Math.abs(this.#scrollBounds?.[0] ?? 0) ? 'anchor' : 'scroll')
     }
     async #display(promise) {
         const { index, src, anchor, onLoad, select } = await promise
