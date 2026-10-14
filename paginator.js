@@ -888,8 +888,10 @@ export class Paginator extends HTMLElement {
     #enterContinuous(anchor = this.#anchor) {
         this.#pendingContinuousAnchor = anchor
         this.#ensureContinuousSentinels()
-        if (this.#view && this.#index >= 0 && !this.#views.length)
+        if (this.#view && this.#index >= 0 && !this.#views.length) {
             this.#views = [{ index: this.#index, view: this.#view }]
+            this.#view.onExpand = () => this.#onKeptContinuousExpand()
+        }
         // Mirror of the reset in #exitContinuous. Coming from paginated mode,
         // the container retains the previous flow's scroll offset (scrollLeft
         // for horizontal). After the CSS overflow swap, that stale offset
@@ -899,6 +901,18 @@ export class Paginator extends HTMLElement {
         this.#container.scrollLeft = 0
         this.#installContinuousObserver()
         this.#prevScrollOffset = this.#continuousStart()
+        this.#scheduleContinuousCheck(0)
+    }
+    // The chapter kept from paginated mode re-anchors when its layout grows:
+    // its first scrolled layout seats the paginated anchor before paint. Once
+    // the reader has scrolled away from the last programmatic offset, #anchor
+    // lags behind the debounced scroll report, and re-anchoring to it would
+    // undo their scroll; late growth then only schedules the edge check.
+    #onKeptContinuousExpand() {
+        if (this.#reflowing) return
+        if (this.#continuousNavigating
+            || this.start === Math.abs(this.#scrollBounds?.[0] ?? 0))
+            return this.#scrollToAnchor(this.#anchor)
         this.#scheduleContinuousCheck(0)
     }
     #exitContinuous() {
@@ -1859,17 +1873,19 @@ export class Paginator extends HTMLElement {
             const record = await this.#appendContinuous(index)
             if (!record || generation !== this.#continuousGeneration) return
             const target = (typeof anchor === 'function' ? anchor(record.view.document) : anchor) ?? 0
-            // Without enough content below the CFI the browser clamps the
-            // initial scroll offset. Fill the visible area before publishing
-            // the position; the larger preload buffer can load afterwards.
+            const reason = select ? 'selection' : 'navigation'
+            // Seat the target before the first paint. Without enough content
+            // below it the browser clamps this scroll, so fill the visible
+            // area and anchor again before publishing the position; the
+            // larger preload buffer can load afterwards.
+            await this.#scrollToAnchorInRecord(record, target, reason)
             if (!await this.#fillContinuousViewport(record, target)) return
             if (generation !== this.#continuousGeneration) return
             this.#view = record.view
             this.#index = record.index
             this.#installContinuousObserver()
             this.#continuousNavigating = false
-            await this.#scrollToAnchorInRecord(record, target,
-                select ? 'selection' : 'navigation')
+            await this.#scrollToAnchorInRecord(record, target, reason)
         } finally {
             if (generation === this.#continuousGeneration) {
                 this.#continuousNavigating = false
