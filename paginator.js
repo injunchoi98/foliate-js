@@ -1738,16 +1738,27 @@ export class Paginator extends HTMLElement {
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
-        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) return animate(
-            element[scrollProp], offset, 300, easeOutQuad,
-            x => {
-                if (generation === this.#continuousGeneration) element[scrollProp] = x
-            },
-        ).then(() => {
-            if (generation !== this.#continuousGeneration) return
-            this.#scrollBounds = [element[scrollProp], this.atStart ? 0 : size, this.atEnd ? 0 : size]
-            this.#afterScroll(reason)
-        })
+        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) {
+            const from = element[scrollProp]
+            if (!this.scrolled) {
+                // Relocate to the destination before animating. Leaving the
+                // reader mid-turn (Android stops the WebView's frames as the
+                // screen is removed) must still record the page turned to.
+                element[scrollProp] = offset
+                this.#afterScroll(reason)
+                element[scrollProp] = from
+            }
+            return animate(
+                from, offset, 300, easeOutQuad,
+                x => {
+                    if (generation === this.#continuousGeneration) element[scrollProp] = x
+                },
+            ).then(() => {
+                if (generation !== this.#continuousGeneration) return
+                this.#scrollBounds = [element[scrollProp], this.atStart ? 0 : size, this.atEnd ? 0 : size]
+                this.#afterScroll(reason)
+            })
+        }
         else {
             element[scrollProp] = offset
             this.#scrollBounds = [element[scrollProp], this.atStart ? 0 : size, this.atEnd ? 0 : size]
