@@ -52,6 +52,86 @@ const uncollapse = range => {
     return range
 }
 
+// Resolve a position in DOM order; visibility belongs to the caller.
+export const glyphRangeAfter = range => {
+    if (!range?.collapsed) return range
+    const result = range.cloneRange()
+    const { startContainer, startOffset } = range
+    const doc = startContainer.ownerDocument
+    let visited = 0, measured = 0
+    const measurements = new Map()
+    const available = () => visited < 64 && measured < 64
+    const ignored = node => {
+        for (let parent = node; parent; parent = parent.parentNode)
+            if (parent.localName === 'script' || parent.localName === 'style') return true
+        return false
+    }
+    const textGlyph = (node, offset, backwards) => {
+        if (ignored(node) || !node.data.trim()) return null
+        let count = measurements.get(node) ?? 0
+        for (let i = offset; i >= 0 && i < node.length && count < 32 && measured < 64;
+            i += backwards ? -1 : 1) {
+            if (/\s/.test(node.data[i])) continue
+            result.setStart(node, i)
+            result.setEnd(node, i + 1)
+            measured++
+            measurements.set(node, ++count)
+            if (Array.from(result.getClientRects()).some(r => r.width > 0 && r.height > 0))
+                return result
+        }
+        return null
+    }
+    const walk = (walker, node, offset, backwards = false) => {
+        while (node && available()) {
+            visited++
+            const glyph = textGlyph(node, offset, backwards)
+            if (glyph) return glyph
+            node = backwards ? walker.previousNode() : walker.nextNode()
+            offset = backwards ? (node?.length ?? 0) - 1 : 0
+        }
+        return null
+    }
+    const walker = doc.createTreeWalker(doc.body ?? doc.documentElement, 4)
+    if (startContainer.nodeType === 3) {
+        walker.currentNode = startContainer
+        const glyph = walk(walker, startContainer, startOffset)
+        if (glyph || !available()) return glyph
+        walker.currentNode = startContainer
+        return walk(walker, startContainer, startOffset - 1, true)
+    }
+    if (startContainer.nodeType !== 1 || ignored(startContainer)) return null
+    const backwards = startOffset === startContainer.childNodes.length
+    let child = startContainer.childNodes[startOffset] ?? startContainer.lastChild ?? startContainer
+    let last = child
+    while (child && available()) {
+        last = child
+        if (!ignored(child)) {
+            const children = doc.createTreeWalker(child, 4)
+            const text = child.nodeType === 3 ? child
+                : backwards ? children.lastChild() : children.nextNode()
+            if (child.nodeType === 3) children.currentNode = child
+            const glyph = walk(children, text, backwards ? (text?.length ?? 0) - 1 : 0, backwards)
+            if (glyph) return glyph
+            const rect = child.getBoundingClientRect?.()
+            if (rect?.width > 0 && rect?.height > 0) return child
+        }
+        if (child.nodeType !== 3) visited++
+        if (child === startContainer) break
+        child = backwards ? child.previousSibling : child.nextSibling
+    }
+    // Empty links and whitespace-only containers can precede the next paragraph.
+    if (!available()) return null
+    if (!backwards) while (last.lastChild) last = last.lastChild
+    walker.currentNode = last
+    const next = backwards && startContainer.childNodes.length
+        ? walker.previousNode() : walker.nextNode()
+    return walk(walker, next, backwards && startContainer.childNodes.length ? (next?.length ?? 0) - 1 : 0,
+        backwards && startContainer.childNodes.length > 0)
+}
+
+// Integer offsetTop and snapped scrolling can differ from fractional sizes by up to 1.5px.
+const CONTINUOUS_EDGE_TOLERANCE = 2
+
 const makeRange = (doc, node, start, end = start) => {
     const range = doc.createRange()
     range.setStart(node, start)
@@ -961,7 +1041,8 @@ export class Paginator extends HTMLElement {
         if (this.#continuousNavigating) return this.#scheduleContinuousCheck(0)
         // Judge by the end before the growth: the grown tail may now reach
         // into the viewport, yet every line of it was above the reading line.
-        if (delta && this.#recordOffset(record) + size - delta <= this.#continuousStart()) {
+        if (delta && this.#recordOffset(record) + size - delta
+            <= this.#continuousStart() + CONTINUOUS_EDGE_TOLERANCE) {
             const offset = this.#container[this.scrollProp]
             this.#container[this.scrollProp] += this.#vertical ? -delta : delta
             this.#justAnchored = true
@@ -1279,8 +1360,9 @@ export class Paginator extends HTMLElement {
         }
     }
     #getAnchorOffset(record, anchor) {
-        const target = typeof anchor === 'function'
+        let target = typeof anchor === 'function'
             ? anchor(record.view.document) : anchor
+        if (target?.collapsed) target = glyphRangeAfter(target)
         const rects = uncollapse(target)?.getClientRects?.()
         if (rects) {
             const rect = Array.from(rects)
@@ -1862,16 +1944,9 @@ export class Paginator extends HTMLElement {
         this.#anchor = anchor
         // A collapsed range is a reading position; uncollapsing widens it.
         const position = anchor?.collapsed === true
-        const target = uncollapse(anchor)
-        let rects = target?.getClientRects?.()
-        // A position at a collapsed space has no box; it means the glyph after.
-        if (rects && position && target.endContainer?.nodeType === 3) {
-            const hasBox = () => Array.from(rects).some(r => r.width > 0 && r.height > 0)
-            for (let i = 0; i < 32 && !hasBox() && target.endOffset < target.endContainer.length; i++) {
-                target.setEnd(target.endContainer, target.endOffset + 1)
-                rects = target.getClientRects()
-            }
-        }
+        const target = position ? glyphRangeAfter(anchor) : uncollapse(anchor)
+        if (position && !target) return
+        const rects = target?.getClientRects?.()
         // if anchor is an element or a range
         if (rects) {
             // when the start of the range is immediately after a hyphen in the
