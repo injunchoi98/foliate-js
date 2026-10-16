@@ -92,6 +92,11 @@ const getBoundingClientRect = target => {
 }
 
 const getVisibleRange = (doc, start, end, mapRect, includePartialStart = false, paginated = false) => {
+    // Pages laid out without a gap (vertical text) abut, and the glyph box
+    // at the end of a line can overhang the next page by a subpixel. Such a
+    // sliver is not visible text on that page: a text node needs more than
+    // that in view, and a single glyph belongs to the page holding most of it.
+    const sliver = paginated ? 1 : 0
     // first get all visible nodes
     const acceptNode = node => {
         const name = node.localName?.toLowerCase()
@@ -116,7 +121,7 @@ const getVisibleRange = (doc, start, end, mapRect, includePartialStart = false, 
             range.selectNodeContents(node)
             const { left, right } = mapRect(range.getBoundingClientRect())
             // it's visible if any part of it is in view
-            if (paginated ? right > start && left < end : right >= start && left <= end)
+            if (paginated ? right > start + sliver && left < end - sliver : right >= start && left <= end)
                 return FILTER_ACCEPT
         }
         return FILTER_SKIP
@@ -131,17 +136,34 @@ const getVisibleRange = (doc, start, end, mapRect, includePartialStart = false, 
     const to = nodes[nodes.length - 1] ?? from
 
     // find the offset at which visibility changes
-    const startOffset = from.nodeType === 1 ? 0
+    let startOffset = from.nodeType === 1 ? 0
         : bisectNode(doc, from, (a, b) => {
+            // The final step compares a single glyph, not a run of text.
+            const glyph = paginated && a.collapsed
             // A caret on a column edge can lie outside the glyph it represents.
             const p = mapRect(getBoundingClientRect(paginated ? uncollapse(a) : a))
             const q = mapRect(getBoundingClientRect(b))
             // A line clipped by the scroll viewport is still being read.
             // Save its first character, rather than the end of that line.
-            if (includePartialStart) return p.right > start ? -1 : 1
+            // In page mode every line end may overhang; a run of text has
+            // to reach past the sliver to count as being on the page.
+            if (includePartialStart)
+                return (glyph ? (p.left + p.right) / 2 : p.right - sliver) > start ? -1 : 1
             if (p.right < start && q.left > start) return 0
             return q.left > start ? -1 : 1
         })
+    // The position after an overhanging glyph may be a collapsed space with
+    // no box at all; a reading position there cannot be shown. Step on to
+    // the first glyph that has a box and sits on the page.
+    if (paginated && from.nodeType !== 1) {
+        let offset = startOffset
+        while (offset < from.length) {
+            const { left, right } = mapRect(getBoundingClientRect(makeRange(doc, from, offset, offset + 1)))
+            if (right > left && (left + right) / 2 > start) break
+            offset++
+        }
+        if (offset < from.length) startOffset = offset
+    }
     const endOffset = to.nodeType === 1 ? 0
         : bisectNode(doc, to, (a, b) => {
             const p = mapRect(getBoundingClientRect(a))
@@ -1768,13 +1790,20 @@ export class Paginator extends HTMLElement {
                 ? ({ top, bottom }) => ({ left: top, right: bottom })
                 : f => f
     }
-    async #scrollToRect(rect, reason) {
+    async #scrollToRect(rect, reason, position = false) {
         if (this.scrolled) {
             const offset = this.#getRectMapper()(rect).left - this.#margin
             return this.#scrollTo(offset, reason)
         }
-        const offset = this.#getRectMapper()(rect).left
-        return this.#scrollToPage(Math.floor(offset / this.size) + (this.#rtlScroll ? -1 : 1), reason)
+        const { left, right } = this.#getRectMapper()(rect)
+        const { size } = this
+        // Pages laid out without a gap abut, so a glyph box can overhang its
+        // page by a subpixel. A reading position was saved from the page its
+        // glyph reaches into, so follow it there; anything else opens the
+        // page it starts on. The 0.1px keeps layout rounding from counting.
+        const offset = position && right - left < size / 2
+            ? Math.max(left, right - 0.1) : left + 0.1
+        return this.#scrollToPage(Math.floor(offset / size) + (this.#rtlScroll ? -1 : 1), reason)
     }
     async #scrollTo(offset, reason, smooth) {
         const element = this.#container
@@ -1831,7 +1860,18 @@ export class Paginator extends HTMLElement {
             return
         }
         this.#anchor = anchor
-        const rects = uncollapse(anchor)?.getClientRects?.()
+        // A collapsed range is a reading position; uncollapsing widens it.
+        const position = anchor?.collapsed === true
+        const target = uncollapse(anchor)
+        let rects = target?.getClientRects?.()
+        // A position at a collapsed space has no box; it means the glyph after.
+        if (rects && position && target.endContainer?.nodeType === 3) {
+            const hasBox = () => Array.from(rects).some(r => r.width > 0 && r.height > 0)
+            for (let i = 0; i < 32 && !hasBox() && target.endOffset < target.endContainer.length; i++) {
+                target.setEnd(target.endContainer, target.endOffset + 1)
+                rects = target.getClientRects()
+            }
+        }
         // if anchor is an element or a range
         if (rects) {
             // when the start of the range is immediately after a hyphen in the
@@ -1839,7 +1879,7 @@ export class Paginator extends HTMLElement {
             const rect = Array.from(rects)
                 .find(r => r.width > 0 && r.height > 0) || rects[0]
             if (!rect) return
-            await this.#scrollToRect(rect, reason)
+            await this.#scrollToRect(rect, reason, position)
             return
         }
         // if anchor is a fraction
