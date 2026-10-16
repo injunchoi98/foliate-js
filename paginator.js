@@ -123,10 +123,13 @@ export const glyphRangeAfter = range => {
     if (!available()) return null
     if (!backwards) while (last.lastChild) last = last.lastChild
     walker.currentNode = last
-    const next = backwards && startContainer.childNodes.length
-        ? walker.previousNode() : walker.nextNode()
-    return walk(walker, next, backwards && startContainer.childNodes.length ? (next?.length ?? 0) - 1 : 0,
-        backwards && startContainer.childNodes.length > 0)
+    const reverse = backwards && startContainer.childNodes.length > 0
+    const next = reverse ? walker.previousNode() : walker.nextNode()
+    const glyph = walk(walker, next, reverse ? (next?.length ?? 0) - 1 : 0, reverse)
+    if (glyph || reverse || !available()) return glyph
+    walker.currentNode = startContainer.childNodes[startOffset] ?? startContainer
+    const previous = walker.previousNode()
+    return walk(walker, previous, (previous?.length ?? 0) - 1, true)
 }
 
 // Integer offsetTop and snapped scrolling can differ from fractional sizes by up to 1.5px.
