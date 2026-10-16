@@ -640,6 +640,9 @@ export class Paginator extends HTMLElement {
             grid-column: 1 / -1;
             grid-row: 1 / -1;
             overflow: auto;
+            /* Chapter insertion, trimming and growth are compensated
+               explicitly; a native adjustment on top would double it. */
+            overflow-anchor: none;
         }
         #container::-webkit-scrollbar {
             display: none;
@@ -889,8 +892,9 @@ export class Paginator extends HTMLElement {
         this.#pendingContinuousAnchor = anchor
         this.#ensureContinuousSentinels()
         if (this.#view && this.#index >= 0 && !this.#views.length) {
-            this.#views = [{ index: this.#index, view: this.#view }]
-            this.#view.onExpand = () => this.#onKeptContinuousExpand()
+            const record = { index: this.#index, view: this.#view, size: null }
+            this.#views = [record]
+            this.#view.onExpand = () => this.#onKeptContinuousExpand(record)
         }
         // Mirror of the reset in #exitContinuous. Coming from paginated mode,
         // the container retains the previous flow's scroll offset (scrollLeft
@@ -908,11 +912,47 @@ export class Paginator extends HTMLElement {
     // the reader has scrolled away from the last programmatic offset, #anchor
     // lags behind the debounced scroll report, and re-anchoring to it would
     // undo their scroll; late growth then only schedules the edge check.
-    #onKeptContinuousExpand() {
+    #onKeptContinuousExpand(record) {
         if (this.#reflowing) return
         if (this.#continuousNavigating
-            || this.start === Math.abs(this.#scrollBounds?.[0] ?? 0))
+            || this.start === Math.abs(this.#scrollBounds?.[0] ?? 0)) {
+            record.size = this.#recordSize(record)
             return this.#scrollToAnchor(this.#anchor)
+        }
+        // Scrolled away: growth entirely above the viewport still shifts
+        // the reading line, which the record handler compensates.
+        this.#onContinuousRecordExpand(record)
+    }
+    // A loaded chapter that grows after its restore scroll (font swap, late
+    // images, style changes) pushes the reading line by the growth above it.
+    // `View#expand` reports no previous size, so the record remembers its
+    // last size. A chapter entirely before the viewport moves the reading
+    // content by exactly its growth: scroll by that delta, like the prepend
+    // compensation. The chapter being read re-seats its anchor under the
+    // kept-chapter rule: only while the reader has not scrolled away from
+    // the last programmatic offset. Growth below the viewport needs nothing.
+    #onContinuousRecordExpand(record) {
+        const size = this.#recordSize(record)
+        const delta = record.size == null ? 0 : size - record.size
+        record.size = size
+        if (this.#reflowing || record.staged || !this.#views.includes(record)) return
+        if (this.#continuousNavigating) return this.#scheduleContinuousCheck(0)
+        // Judge by the end before the growth: the grown tail may now reach
+        // into the viewport, yet every line of it was above the reading line.
+        if (delta && this.#recordOffset(record) + size - delta <= this.#continuousStart()) {
+            const offset = this.#container[this.scrollProp]
+            this.#container[this.scrollProp] += this.#vertical ? -delta : delta
+            this.#justAnchored = true
+            // Growth compensation must not be mistaken for a user scroll.
+            if (this.#scrollBounds) this.#scrollBounds[0] += this.#container[this.scrollProp] - offset
+            return this.#scheduleContinuousCheck(0)
+        }
+        const anchor = this.#anchor ?? this.#lastVisibleRange
+        const doc = anchor?.startContainer?.ownerDocument ?? anchor?.ownerDocument
+        if (record.view === this.#view
+            && (!doc || doc === record.view.document)
+            && this.start === Math.abs(this.#scrollBounds?.[0] ?? 0))
+            return this.#scrollToAnchorInRecord(record, anchor, 'anchor').catch(e => console.warn(e))
         this.#scheduleContinuousCheck(0)
     }
     #exitContinuous() {
@@ -1021,11 +1061,12 @@ export class Paginator extends HTMLElement {
         if (!this.#canGoToIndex(index) || this.#hasContinuousRecord(index)) return null
         this.#ensureContinuousSentinels()
 
+        const record = { index, view: null, staged: true, loaded: false, size: null }
         const view = new View({
             container: this,
-            onExpand: () => this.#scheduleContinuousCheck(0),
+            onExpand: () => this.#onContinuousRecordExpand(record),
         })
-        const record = { index, view, staged: true, loaded: false }
+        record.view = view
         // Stage the wrapper out-of-flow during iframe load so it doesn't push
         // visible content. iframe still loads and lays out (its width inherits
         // 100% of container via absolute positioning). Caller commits to flow
@@ -1547,10 +1588,18 @@ export class Paginator extends HTMLElement {
     render() {
         if (this.#reflowing) return
         if (this.scrolled && this.#views.length) {
-            const active = this.#getActiveViewRecord()
             const entering = this.#pendingContinuousAnchor !== null
+            // A resize has already reflowed the chapters: the range visible
+            // now at the same offset is earlier content, so re-anchoring to
+            // it (and reporting it) moves the saved position back. Prefer
+            // the range that was visible before the reflow, as long as its
+            // chapter is still loaded.
+            const last = this.#lastVisibleRange
+            const lastRecord = last && !entering ? this.#views.find(record =>
+                !record.staged && record.view.document === (last.startContainer?.ownerDocument ?? last.ownerDocument)) : null
+            const active = lastRecord ?? this.#getActiveViewRecord()
             const anchor = this.#pendingContinuousAnchor
-                ?? (active ? this.#getVisibleRangeForRecord(active) : this.#anchor)
+                ?? (lastRecord ? last : active ? this.#getVisibleRangeForRecord(active) : this.#anchor)
             this.#pendingContinuousAnchor = null
             if (entering && active) this.#continuousNavigating = true
             for (const record of this.#views.filter(record => !record.staged))
