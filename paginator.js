@@ -286,6 +286,13 @@ const setSelectionTo = (target, collapse) => {
     }
 }
 
+// The caret placed after navigation serves caret browsing and keyboard
+// selection. A touch device has neither, and iOS paints that caret in
+// non-editable content as a selection box over the new page until its
+// text is drawn, so leave the selection alone there.
+export const placesNavigationCaret = (win = globalThis) =>
+    !win.matchMedia?.('(pointer: coarse)')?.matches
+
 const getDirection = doc => {
     const { defaultView } = doc
     const { writingMode, direction } = defaultView.getComputedStyle(doc.body)
@@ -840,6 +847,7 @@ export class Paginator extends HTMLElement {
         })
 
         this.addEventListener('relocate', ({ detail }) => {
+            if (!placesNavigationCaret()) return
             if (detail.reason === 'selection') setSelectionTo(this.#anchor, 0)
             else if (detail.reason === 'navigation') {
                 if (this.#anchor === 1) setSelectionTo(detail.range, 1)
