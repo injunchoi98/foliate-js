@@ -46,8 +46,8 @@ const uncollapse = range => {
         if (node?.nodeType === 1) return node
         return endContainer
     }
-    if (endOffset + 1 < endContainer.length) range.setEnd(endContainer, endOffset + 1)
-    else if (endOffset > 1) range.setStart(endContainer, endOffset - 1)
+    if (endOffset < endContainer.length) range.setEnd(endContainer, endOffset + 1)
+    else if (endOffset > 0) range.setStart(endContainer, endOffset - 1)
     else return endContainer.parentNode
     return range
 }
@@ -578,6 +578,9 @@ export class Paginator extends HTMLElement {
             grid-column: 1 / -1;
             grid-row: 1 / -1;
             overflow: auto;
+            /* Chapter insertion, trimming and growth are compensated
+               explicitly; a native adjustment on top would double it. */
+            overflow-anchor: none;
         }
         #container::-webkit-scrollbar {
             display: none;
@@ -826,8 +829,11 @@ export class Paginator extends HTMLElement {
     #enterContinuous(anchor = this.#anchor) {
         this.#pendingContinuousAnchor = anchor
         this.#ensureContinuousSentinels()
-        if (this.#view && this.#index >= 0 && !this.#views.length)
-            this.#views = [{ index: this.#index, view: this.#view }]
+        if (this.#view && this.#index >= 0 && !this.#views.length) {
+            const record = { index: this.#index, view: this.#view, size: null }
+            this.#views = [record]
+            this.#view.onExpand = () => this.#onKeptContinuousExpand(record)
+        }
         // Mirror of the reset in #exitContinuous. Coming from paginated mode,
         // the container retains the previous flow's scroll offset (scrollLeft
         // for horizontal). After the CSS overflow swap, that stale offset
@@ -837,6 +843,53 @@ export class Paginator extends HTMLElement {
         this.#container.scrollLeft = 0
         this.#installContinuousObserver()
         this.#prevScrollOffset = this.#continuousStart()
+        this.#scheduleContinuousCheck(0)
+    }
+    // The chapter kept from paginated mode re-anchors when its layout grows:
+    // its first scrolled layout seats the paginated anchor before paint. Once
+    // the reader has scrolled away from the last programmatic offset, #anchor
+    // lags behind the debounced scroll report, and re-anchoring to it would
+    // undo their scroll; late growth then only schedules the edge check.
+    #onKeptContinuousExpand(record) {
+        if (this.#continuousNavigating
+            || this.start === Math.abs(this.#scrollBounds?.[0] ?? 0)) {
+            record.size = this.#recordSize(record)
+            return this.#scrollToAnchor(this.#anchor)
+        }
+        // Scrolled away: growth entirely above the viewport still shifts
+        // the reading line, which the record handler compensates.
+        this.#onContinuousRecordExpand(record)
+    }
+    // A loaded chapter that grows after its restore scroll (font swap, late
+    // images, style changes) pushes the reading line by the growth above it.
+    // `View#expand` reports no previous size, so the record remembers its
+    // last size. A chapter entirely before the viewport moves the reading
+    // content by exactly its growth: scroll by that delta, like the prepend
+    // compensation. The chapter being read re-seats its anchor under the
+    // kept-chapter rule: only while the reader has not scrolled away from
+    // the last programmatic offset. Growth below the viewport needs nothing.
+    #onContinuousRecordExpand(record) {
+        const size = this.#recordSize(record)
+        const delta = record.size == null ? 0 : size - record.size
+        record.size = size
+        if (record.staged || !this.#views.includes(record)) return
+        if (this.#continuousNavigating) return this.#scheduleContinuousCheck(0)
+        // Judge by the end before the growth: the grown tail may now reach
+        // into the viewport, yet every line of it was above the reading line.
+        if (delta && this.#recordOffset(record) + size - delta <= this.#continuousStart()) {
+            const offset = this.#container[this.scrollProp]
+            this.#container[this.scrollProp] += this.#vertical ? -delta : delta
+            this.#justAnchored = true
+            // Growth compensation must not be mistaken for a user scroll.
+            if (this.#scrollBounds) this.#scrollBounds[0] += this.#container[this.scrollProp] - offset
+            return this.#scheduleContinuousCheck(0)
+        }
+        const anchor = this.#anchor ?? this.#lastVisibleRange
+        const doc = anchor?.startContainer?.ownerDocument ?? anchor?.ownerDocument
+        if (record.view === this.#view
+            && (!doc || doc === record.view.document)
+            && this.start === Math.abs(this.#scrollBounds?.[0] ?? 0))
+            return this.#scrollToAnchorInRecord(record, anchor, 'anchor').catch(e => console.warn(e))
         this.#scheduleContinuousCheck(0)
     }
     #exitContinuous() {
@@ -944,11 +997,12 @@ export class Paginator extends HTMLElement {
         if (!this.#canGoToIndex(index) || this.#hasContinuousRecord(index)) return null
         this.#ensureContinuousSentinels()
 
+        const record = { index, view: null, staged: true, loaded: false, size: null }
         const view = new View({
             container: this,
-            onExpand: () => this.#scheduleContinuousCheck(0),
+            onExpand: () => this.#onContinuousRecordExpand(record),
         })
-        const record = { index, view, staged: true, loaded: false }
+        record.view = view
         // Stage the wrapper out-of-flow during iframe load so it doesn't push
         // visible content. iframe still loads and lays out (its width inherits
         // 100% of container via absolute positioning). Caller commits to flow
@@ -1396,10 +1450,18 @@ export class Paginator extends HTMLElement {
     }
     render() {
         if (this.scrolled && this.#views.length) {
-            const active = this.#getActiveViewRecord()
             const entering = this.#pendingContinuousAnchor !== null
+            // A resize has already reflowed the chapters: the range visible
+            // now at the same offset is earlier content, so re-anchoring to
+            // it (and reporting it) moves the saved position back. Prefer
+            // the range that was visible before the reflow, as long as its
+            // chapter is still loaded.
+            const last = this.#lastVisibleRange
+            const lastRecord = last && !entering ? this.#views.find(record =>
+                !record.staged && record.view.document === (last.startContainer?.ownerDocument ?? last.ownerDocument)) : null
+            const active = lastRecord ?? this.#getActiveViewRecord()
             const anchor = this.#pendingContinuousAnchor
-                ?? (active ? this.#getVisibleRangeForRecord(active) : this.#anchor)
+                ?? (lastRecord ? last : active ? this.#getVisibleRangeForRecord(active) : this.#anchor)
             this.#pendingContinuousAnchor = null
             if (entering && active) this.#continuousNavigating = true
             for (const record of this.#views.filter(record => !record.staged)) record.view.render(this.#beforeRender({
@@ -1586,19 +1648,30 @@ export class Paginator extends HTMLElement {
         }
         // FIXME: vertical-rl only, not -lr
         if (this.scrolled && this.#vertical) offset = -offset
-        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) return animate(
-            element[scrollProp], offset, 300, easeOutQuad,
-            x => {
-                if (generation === this.#continuousGeneration) element[scrollProp] = x
-            },
-        ).then(() => {
-            if (generation !== this.#continuousGeneration) return
-            this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
-            this.#afterScroll(reason)
-        })
+        if ((reason === 'snap' || smooth) && this.hasAttribute('animated')) {
+            const from = element[scrollProp]
+            if (!this.scrolled) {
+                // Relocate to the destination before animating. Leaving the
+                // reader mid-turn (Android stops the WebView's frames as the
+                // screen is removed) must still record the page turned to.
+                element[scrollProp] = offset
+                this.#afterScroll(reason)
+                element[scrollProp] = from
+            }
+            return animate(
+                from, offset, 300, easeOutQuad,
+                x => {
+                    if (generation === this.#continuousGeneration) element[scrollProp] = x
+                },
+            ).then(() => {
+                if (generation !== this.#continuousGeneration) return
+                this.#scrollBounds = [element[scrollProp], this.atStart ? 0 : size, this.atEnd ? 0 : size]
+                this.#afterScroll(reason)
+            })
+        }
         else {
             element[scrollProp] = offset
-            this.#scrollBounds = [offset, this.atStart ? 0 : size, this.atEnd ? 0 : size]
+            this.#scrollBounds = [element[scrollProp], this.atStart ? 0 : size, this.atEnd ? 0 : size]
             this.#afterScroll(reason)
         }
     }
@@ -1717,17 +1790,19 @@ export class Paginator extends HTMLElement {
             const record = await this.#appendContinuous(index)
             if (!record || generation !== this.#continuousGeneration) return
             const target = (typeof anchor === 'function' ? anchor(record.view.document) : anchor) ?? 0
-            // Without enough content below the CFI the browser clamps the
-            // initial scroll offset. Fill the visible area before publishing
-            // the position; the larger preload buffer can load afterwards.
+            const reason = select ? 'selection' : 'navigation'
+            // Seat the target before the first paint. Without enough content
+            // below it the browser clamps this scroll, so fill the visible
+            // area and anchor again before publishing the position; the
+            // larger preload buffer can load afterwards.
+            await this.#scrollToAnchorInRecord(record, target, reason)
             if (!await this.#fillContinuousViewport(record, target)) return
             if (generation !== this.#continuousGeneration) return
             this.#view = record.view
             this.#index = record.index
             this.#installContinuousObserver()
             this.#continuousNavigating = false
-            await this.#scrollToAnchorInRecord(record, target,
-                select ? 'selection' : 'navigation')
+            await this.#scrollToAnchorInRecord(record, target, reason)
         } finally {
             if (generation === this.#continuousGeneration) {
                 this.#continuousNavigating = false
