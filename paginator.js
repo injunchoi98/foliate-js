@@ -1976,7 +1976,8 @@ export class Paginator extends HTMLElement {
         const { pages } = this
         if (!pages) return
         const textPages = pages - 2
-        const newPage = Math.round(anchor * (textPages - 1))
+        // A section without text pages still has page 1 to land on.
+        const newPage = Math.round(anchor * Math.max(0, textPages - 1))
         await this.#scrollToPage(newPage + 1, reason)
     }
     #getVisibleRange() {
@@ -2004,8 +2005,11 @@ export class Paginator extends HTMLElement {
         else if (this.pages > 0) {
             const { page, pages } = this
             this.#header.style.visibility = page > 1 ? 'visible' : 'hidden'
-            detail.fraction = (page - 1) / (pages - 2)
-            detail.size = 1 / (pages - 2)
+            const textPages = pages - 2
+            // A section without text pages (e.g. an empty trailing MOBI part)
+            // has nothing left to read, so it reports its end.
+            detail.fraction = textPages > 0 ? (page - 1) / textPages : 1
+            detail.size = textPages > 0 ? 1 / textPages : 0
         }
         this.dispatchEvent(new CustomEvent('relocate', { detail }))
     }
